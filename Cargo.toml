@@ -4,12 +4,19 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+alloy = { version = "1.8", default-features = false, features = ["signer-local"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 dotenvy = "0.15"
 futures-util = "0.3"
+polymarket-client-sdk = { version = "0.4.4", features = ["clob", "heartbeats"] }
+rust_decimal = "1.41"
+rust_decimal_macros = "1.40"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "gzip", "brotli", "deflate"] }
+# rustls 0.23: tüm bağımlılıklar (reqwest 0.12/0.13, tokio-tungstenite) için tek crypto backend (ring).
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+uuid = "1"
 tokio-tungstenite = { version = "0.26", features = ["rustls-tls-webpki-roots"] }

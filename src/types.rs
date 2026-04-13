@@ -51,6 +51,9 @@ pub struct Features {
     pub pressure: f32,
     pub reaction_speed: f32,
     pub time_decay: f32,
+    /// Bu tick’teki WS trade sayısı (pencere boyutu üst sınırlı).
+    #[serde(default)]
+    pub trade_count: u32,
 }
 
 // ─── SIGNALS ────────────────────────────────────────────
@@ -125,6 +128,12 @@ pub struct LogEntry {
     pub decision: Decision,
     pub dominant_signal: DominantSignal,
     pub features_snapshot: Features,
+    /// Filled when a live order is placed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub order_id: Option<String>,
+    /// Limit price used for the order.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_price: Option<f32>,
 }
 
 // ─── HELPERS ────────────────────────────────────────────

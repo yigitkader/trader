@@ -1,22 +1,26 @@
 use crate::types::Features;
 
-// Monotonic stack mantığı:
-// Fiyat hızlı yükseldi ama volume bunu desteklemiyor
-// → sahte hareket, geri dönme ihtimali yüksek
+// Large price move on thin volume → likely reversal.
+// SIGNED: positive momentum (YES up) on thin tape → expect reversion down → negative signal.
+// Negative momentum (YES down) on thin tape → expect reversion up → positive signal.
 
-const MOMENTUM_THRESHOLD: f32 = 0.03;  // %3 fiyat hareketi
-const VOLUME_THRESHOLD: f32 = 0.001;   // düşük reaction speed eşiği
+const MOMENTUM_THRESHOLD: f32 = 0.03;
+const VOLUME_THRESHOLD: f32 = 0.001;
 
 pub fn compute(f: &Features) -> f32 {
-    let strong_momentum = f.momentum.abs() > MOMENTUM_THRESHOLD;
-    let weak_volume = f.reaction_speed > VOLUME_THRESHOLD;
-
-    if strong_momentum && weak_volume {
-        // ne kadar güçlü sahte hareket?
-        let momentum_strength = (f.momentum.abs() / MOMENTUM_THRESHOLD).min(3.0) / 3.0;
-        let volume_weakness = (f.reaction_speed / VOLUME_THRESHOLD).min(3.0) / 3.0;
-        (momentum_strength + volume_weakness) / 2.0
-    } else {
-        0.0
+    let m = f.momentum;
+    if m.abs() <= MOMENTUM_THRESHOLD {
+        return 0.0;
     }
+    if f.reaction_speed <= VOLUME_THRESHOLD {
+        return 0.0;
+    }
+
+    let momentum_strength = (m.abs() / MOMENTUM_THRESHOLD).min(3.0) / 3.0;
+    let volume_weakness = (f.reaction_speed / VOLUME_THRESHOLD).min(3.0) / 3.0;
+    let magnitude = (momentum_strength + volume_weakness) / 2.0;
+
+    // Fake move UP → expect reversion DOWN → bearish YES → negative
+    let direction = -m.signum();
+    (direction * magnitude).clamp(-1.0, 1.0)
 }

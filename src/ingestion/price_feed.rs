@@ -130,16 +130,20 @@ pub async fn fetch_markets(client: &Client) -> anyhow::Result<Vec<Market>> {
                 continue;
             };
 
-            let yes_price = gm
+            let Some(yes_price) = gm
                 .outcome_prices
                 .get(yi)
                 .and_then(|s| s.parse::<f32>().ok())
-                .unwrap_or(0.5);
-            let no_price = gm
+            else {
+                continue;
+            };
+            let Some(no_price) = gm
                 .outcome_prices
                 .get(ni)
                 .and_then(|s| s.parse::<f32>().ok())
-                .unwrap_or(1.0 - yes_price);
+            else {
+                continue;
+            };
 
             // Gamma bazen spread'i direkt veriyor; yoksa yaklaşık hesapla.
             let spread = gm

@@ -17,9 +17,17 @@ pub fn compute(trades: &VecDeque<RawTrade>) -> f32 {
         }
     }
 
+    // İşlem yokken sell_vol==0 olur; 2.0 dönmek tüm piyasalara sahte "alıcı baskısı" verirdi.
+    if buy_vol == 0.0 && sell_vol == 0.0 {
+        return 1.0;
+    }
     if sell_vol == 0.0 {
-        return 2.0; // tam alıcı baskısı
+        return 2.0;
+    }
+    if buy_vol == 0.0 {
+        return 0.0;
     }
 
-    (buy_vol / sell_vol) as f32
+    let r = buy_vol / sell_vol;
+    (r.clamp(0.0, 20.0)) as f32
 }

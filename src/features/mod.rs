@@ -16,6 +16,7 @@ pub fn compute_all(
         pressure: pressure::compute(trades),
         reaction_speed: reaction::compute(price_window, trades),
         time_decay: compute_time_decay(market.time_to_resolution),
+        trade_count: trades.len() as u32,
     }
 }
 

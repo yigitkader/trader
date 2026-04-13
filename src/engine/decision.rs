@@ -1,30 +1,48 @@
-use crate::types::{Decision, DominantSignal, SignalSet};
+use crate::types::{Decision, DominantSignal, Market, SignalSet};
 
-const BUY_THRESHOLD: f32 = 0.65;
-const SHORT_THRESHOLD: f32 = 0.35;
+const MIN_OUTCOME_MID: f32 = 0.03;
+const MAX_OUTCOME_MID: f32 = 0.97;
 
-pub fn decide(confidence: f32) -> Decision {
-    if confidence > BUY_THRESHOLD {
-        Decision::BuyYes
-    } else if confidence < SHORT_THRESHOLD {
-        Decision::BuyNo
-    } else {
-        Decision::Skip
+/// Uç fiyatlarda kararı Skip yap (illikit / çözülmüş gösterge).
+pub fn apply_price_gate(decision: Decision, market: &Market) -> Decision {
+    match decision {
+        Decision::Skip => Decision::Skip,
+        Decision::BuyYes => {
+            let y = market.yes_price;
+            if y < MIN_OUTCOME_MID || y > MAX_OUTCOME_MID {
+                Decision::Skip
+            } else {
+                Decision::BuyYes
+            }
+        }
+        Decision::BuyNo => {
+            let n = market.no_price;
+            if n < MIN_OUTCOME_MID || n > MAX_OUTCOME_MID {
+                Decision::Skip
+            } else {
+                Decision::BuyNo
+            }
+        }
     }
 }
 
 pub fn dominant(s: &SignalSet) -> DominantSignal {
-    let max = s.fake_move.max(s.absorption).max(s.panic);
+    let af = s.fake_move.abs();
+    let aa = s.absorption.abs();
+    let ap = s.panic.abs();
+    let max = af.max(aa).max(ap);
 
-    if max < 0.1 {
+    if max < 0.05 {
         return DominantSignal::Mixed;
     }
 
-    if (s.fake_move - max).abs() < 0.05 {
+    if (af - max).abs() < 0.02 && af >= aa && af >= ap {
         DominantSignal::FakeMove
-    } else if (s.absorption - max).abs() < 0.05 {
+    } else if (aa - max).abs() < 0.02 && aa >= ap {
         DominantSignal::Absorption
-    } else {
+    } else if ap > 0.0 {
         DominantSignal::Panic
+    } else {
+        DominantSignal::Mixed
     }
 }

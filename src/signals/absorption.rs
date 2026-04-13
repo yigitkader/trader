@@ -1,20 +1,32 @@
 use crate::types::Features;
 
-// Alıcı baskısı var ama fiyat artmıyor
-// → güçlü satıcı absorbe ediyor
-// → fiyat düşebilir
+// Buyer-heavy tape + calm mid → seller absorbing (potential YES downside).
+// Seller-heavy tape + calm mid → buyer absorbing (potential YES upside).
+// Returns SIGNED value: positive → bullish YES, negative → bearish YES.
 
-const PRESSURE_THRESHOLD: f32 = 1.3;   // buy/sell > 1.3 = alıcı baskısı
-const MOMENTUM_WEAK: f32 = 0.01;       // ama fiyat bu kadar az hareket etti
+const MIN_TRADES: u32 = 6;
+const MAX_MOMENTUM_FOR_ABSORPTION: f32 = 0.06;
+const PRESSURE_SCALE: f32 = 0.35;
 
 pub fn compute(f: &Features) -> f32 {
-    let buyer_pressure = f.pressure > PRESSURE_THRESHOLD;
-    let price_not_moving = f.momentum.abs() < MOMENTUM_WEAK;
-
-    if buyer_pressure && price_not_moving {
-        let pressure_strength = ((f.pressure - PRESSURE_THRESHOLD) / PRESSURE_THRESHOLD).min(1.0);
-        pressure_strength
-    } else {
-        0.0
+    if f.trade_count < MIN_TRADES {
+        return 0.0;
     }
+
+    let imbalance = f.pressure - 1.0;
+    if imbalance.abs() < 0.01 {
+        return 0.0;
+    }
+
+    let m = f.momentum.abs();
+    if m >= MAX_MOMENTUM_FOR_ABSORPTION {
+        return 0.0;
+    }
+    let calm = 1.0 - (m / MAX_MOMENTUM_FOR_ABSORPTION);
+    let strength = (imbalance.abs() / PRESSURE_SCALE).clamp(0.0, 1.0);
+
+    // seller pressure (pressure < 1) + calm → buyers absorb → YES likely up → positive
+    // buyer pressure (pressure > 1) + calm → sellers absorb → YES likely down → negative
+    let direction = -imbalance.signum();
+    (direction * strength * calm).clamp(-1.0, 1.0)
 }

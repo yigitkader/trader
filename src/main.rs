@@ -51,14 +51,16 @@ fn truncate(s: &str, max: usize) -> String {
 
 #[tokio::main]
 async fn main() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let exec_cfg = execution::ExecutionConfig::load();
     let client = http_client::build().expect("HTTP client (reqwest) kurulamadı");
     let mut price_windows: HashMap<String, VecDeque<(u64, f32)>> = HashMap::new();
     let trade_buffers: SharedTradeBuffers = Arc::new(Mutex::new(HashMap::new()));
     let mut ranker = engine::ranker::Ranker::new();
 
+    let mut risk_gate = execution::RiskGate::new();
+
     let hub_tx = ingestion::trade_stream::spawn_trade_hub(Arc::clone(&trade_buffers));
-    // Bir önceki tick'te en az bir YES asset_id ile hub'a liste gönderildi mi? (Boş send spam'ini önler.)
     let mut had_ws_asset_subscriptions = false;
     let mut tick: u64 = 0;
 
@@ -68,7 +70,7 @@ async fn main() {
     );
     let max_ttr = ingestion::market_meta::max_time_to_resolution_secs();
     println!(
-        "Filtreler: TTR ≥ {}s | spread ≤ {:.2} | hacim ≥ {:.0} (Gamma) | karar eşiği conf>0.65 / <0.35{}",
+        "Filtreler: TTR ≥ {}s | spread ≤ {:.2} | hacim ≥ {:.0} (Gamma) | min_edge>0.025{}",
         ingestion::market_meta::MIN_TTR_SECS,
         ingestion::market_meta::MAX_SPREAD,
         ingestion::market_meta::MIN_VOLUME,
@@ -82,6 +84,7 @@ async fn main() {
     loop {
         tick += 1;
         ranker.clear();
+        risk_gate.begin_tick();
 
         // 1. Marketleri çek
         let markets = match ingestion::price_feed::fetch_markets(&client).await {
@@ -130,6 +133,7 @@ async fn main() {
             let mut g = trade_buffers.lock().await;
             g.retain(|id, _| tradeable_market_ids.contains(id));
         }
+        price_windows.retain(|id, _| tradeable_market_ids.contains(id));
 
         let trade_buffer_stats = {
             let g = trade_buffers.lock().await;
@@ -188,10 +192,10 @@ async fn main() {
             let sigs = signals::compute_all(&feats);
 
             // 7. Engine
-            let scored = engine::process(&sigs, &market.id, market.yes_price);
+            let scored = engine::process(&sigs, market);
 
             max_conf = max_conf.max(scored.confidence);
-            max_edge = max_edge.max(scored.edge_score);
+            max_edge = max_edge.max(scored.edge_score.abs());
 
             // 8. Sadece anlamlı sinyalleri logla
             if !matches!(scored.decision, types::Decision::Skip) {
@@ -206,6 +210,8 @@ async fn main() {
                     decision: scored.decision.clone(),
                     dominant_signal: scored.dominant_signal.clone(),
                     features_snapshot: feats.clone(),
+                    order_id: None,
+                    limit_price: None,
                 };
 
                 if let Err(e) = logger::writer::write(&entry) {
@@ -226,13 +232,13 @@ async fn main() {
                 );
 
                 if let Err(e) =
-                    execution::handle_signal(&exec_cfg, &client, market, &scored, tick).await
+                    execution::handle_signal(&exec_cfg, &client, market, &scored, tick, &mut risk_gate).await
                 {
                     eprintln!("[tick {}] execution error: {:#}", tick, e);
                 }
-            }
 
-            ranker.push(scored);
+                ranker.push(scored);
+            }
         }
 
         // --- Özet satırı ---
@@ -268,11 +274,13 @@ async fn main() {
             );
         }
 
-        // Top fırsatları göster (bu tick’teki tüm skorlar; çoğu Skip olabilir)
+        // Top fırsatlar: yalnızca Skip olmayan (fiyat kapısı + eşik geçen) adaylar
         println!("--- TOP {} (confidence) ---", engine::ranker::TOP_N);
         let top = ranker.top_n();
         if top.is_empty() {
-            println!("  (boş — işlem gören piyasa yok, önce filtreleri kontrol edin)");
+            println!(
+                "  (boş — bu tick’te Skip dışı karar yok: conf eşiği veya fiyat kapısı / sinyal yok)"
+            );
         } else {
             for (i, m) in top.iter().enumerate() {
                 let q = id_to_question

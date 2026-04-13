@@ -81,10 +81,9 @@ pub fn filter_summary(markets: &[Market]) -> FilterSummary {
 }
 
 pub fn is_tradeable(market: &Market) -> bool {
-    if let Some(v) = market.volume {
-        if v < MIN_VOLUME {
-            return false;
-        }
+    match market.volume {
+        Some(v) if v >= MIN_VOLUME => {}
+        _ => return false,
     }
     if market.spread > MAX_SPREAD {
         return false;

@@ -15,7 +15,8 @@ use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message;
 
 const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
-const BUFFER_SIZE: usize = 50;
+const BUFFER_MAX_TRADES: usize = 200;
+const BUFFER_WINDOW_SECS: u64 = 300;
 const MAX_ASSETS_PER_MESSAGE: usize = 200;
 const PING_INTERVAL_SECS: u64 = 10;
 const WS_RECONNECT_SECS: u64 = 5;
@@ -38,11 +39,19 @@ struct DynamicSubscribe<'a> {
 }
 
 pub fn new_buffer() -> TradeBuffer {
-    VecDeque::with_capacity(BUFFER_SIZE)
+    VecDeque::with_capacity(64)
 }
 
 pub fn push_trade(buffer: &mut TradeBuffer, trade: RawTrade) {
-    if buffer.len() == BUFFER_SIZE {
+    // Enforce time window: evict trades older than BUFFER_WINDOW_SECS
+    let ts = trade.timestamp;
+    if ts > 0 {
+        let cutoff = ts.saturating_sub(BUFFER_WINDOW_SECS * 1000);
+        while buffer.front().map(|t| t.timestamp < cutoff).unwrap_or(false) {
+            buffer.pop_front();
+        }
+    }
+    if buffer.len() >= BUFFER_MAX_TRADES {
         buffer.pop_front();
     }
     buffer.push_back(trade);
@@ -107,13 +116,24 @@ async fn maintain_connection(
                         return Ok(());
                     }
                     Some(ids) => {
+                        let new_set: HashSet<&String> = ids.iter().collect();
+                        let to_unsub: Vec<String> = subscribed
+                            .iter()
+                            .filter(|id| !new_set.contains(id))
+                            .cloned()
+                            .collect();
+                        if !to_unsub.is_empty() {
+                            unsubscribe(&mut write, &mut subscribed, &to_unsub).await?;
+                        }
                         *desired = ids;
                         let to_add: Vec<String> = desired
                             .iter()
                             .filter(|id| !subscribed.contains(*id))
                             .cloned()
                             .collect();
-                        subscribe_incremental(&mut write, &mut subscribed, &to_add).await?;
+                        if !to_add.is_empty() {
+                            subscribe_incremental(&mut write, &mut subscribed, &to_add).await?;
+                        }
                     }
                     None => return Ok(()),
                 }
@@ -204,6 +224,34 @@ where
     Ok(())
 }
 
+async fn unsubscribe<W>(
+    write: &mut W,
+    subscribed: &mut HashSet<String>,
+    ids: &[String],
+) -> anyhow::Result<()>
+where
+    W: SinkExt<Message> + Unpin,
+    W::Error: std::error::Error + Send + Sync + 'static,
+{
+    for chunk in ids.chunks(MAX_ASSETS_PER_MESSAGE) {
+        if chunk.is_empty() {
+            continue;
+        }
+        let msg = DynamicSubscribe {
+            assets_ids: chunk,
+            operation: "unsubscribe",
+        };
+        write
+            .send(Message::Text(serde_json::to_string(&msg)?.into()))
+            .await
+            .map_err(|e| anyhow::anyhow!(e))?;
+        for id in chunk {
+            subscribed.remove(id);
+        }
+    }
+    Ok(())
+}
+
 async fn apply_parsed(buffers: &SharedTradeBuffers, text: &str) {
     let trades = parse_ws_text(text);
     if trades.is_empty() {
@@ -227,7 +275,7 @@ fn parse_ws_text(text: &str) -> Vec<RawTrade> {
     };
     match et {
         "last_trade_price" => parse_last_trade_price(&v).into_iter().collect(),
-        "price_change" => parse_price_change(&v),
+        // price_change: book updates, not executions — excluded from trade features.
         _ => Vec::new(),
     }
 }
@@ -250,41 +298,6 @@ fn parse_last_trade_price(v: &Value) -> Option<RawTrade> {
         size,
         timestamp,
     })
-}
-
-fn parse_price_change(v: &Value) -> Vec<RawTrade> {
-    let Some(market) = v.get("market").and_then(|m| m.as_str()) else {
-        return Vec::new();
-    };
-    let market = market.to_string();
-    let ts = json_u64(v, "timestamp").unwrap_or(0);
-    let Some(arr) = v.get("price_changes").and_then(|a| a.as_array()) else {
-        return Vec::new();
-    };
-
-    let mut out = Vec::new();
-    for item in arr {
-        let side_s = item.get("side").and_then(|s| s.as_str()).unwrap_or("");
-        let Some(price) = json_f32(item, "price") else {
-            continue;
-        };
-        let Some(size) = json_f64(item, "size") else {
-            continue;
-        };
-        let side = if side_s.eq_ignore_ascii_case("BUY") {
-            TradeSide::Buy
-        } else {
-            TradeSide::Sell
-        };
-        out.push(RawTrade {
-            market_id: market.clone(),
-            side,
-            price,
-            size,
-            timestamp: ts,
-        });
-    }
-    out
 }
 
 fn json_f32(v: &Value, key: &str) -> Option<f32> {
