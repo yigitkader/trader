@@ -1,7 +1,7 @@
 use crate::types::ScoredMarket;
 use std::collections::BinaryHeap;
 
-const TOP_N: usize = 10;
+pub const TOP_N: usize = 10;
 
 pub struct Ranker {
     heap: BinaryHeap<ScoredMarket>,

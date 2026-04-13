@@ -1,0 +1,307 @@
+Resmi dokümantasyonu okudum. Şimdi tam gerçeği yazıyorum.
+
+---
+
+**Araştırma sonucu — 3 kritik fark buldum:**
+
+---
+
+**1. WS mesaj formatı tamamen farklı**
+
+Bizim yazdığımız `WsTrade` struct'ı yanlıştı. Gerçek Polymarket WS şunu gönderiyor:
+
+`last_trade_price` event'i — tek bir trade:
+```json
+{
+  "asset_id": "114122071509644...",
+  "event_type": "last_trade_price",
+  "fee_rate_bps": "0",
+  "market": "0x6a67b9d828d...",
+  "price": "0.456",
+  "side": "BUY",
+  "size": "219.217767",
+  "timestamp": "1750428146322"
+}
+```
+
+`price_change` event'i — **dizi** geliyor:
+```json
+{
+  "event_type": "price_change",
+  "market": "0x5f65177b...",
+  "price_changes": [ {...}, {...} ],
+  "timestamp": "1757908892351"
+}
+```
+
+Yani tek tip mesaj değil, `event_type` alanına göre parse etmek gerekiyor.
+
+---
+
+**2. Subscription mekanizması farklı**
+
+Biz URL'e `?market=` parametresi geçiyorduk. Bu yanlış. Gerçek flow:
+
+1. `wss://ws-subscriptions-clob.polymarket.com/ws/market` adresine bağlan
+2. Bağlandıktan sonra JSON mesaj gönder:
+```json
+{
+  "assets_ids": ["token_id_1", "token_id_2"],
+  "type": "market",
+  "custom_feature_enabled": true
+}
+```
+3. Her 10 saniyede `PING` gönder, `PONG` gelecek — yoksa bağlantı kapanıyor
+
+Önemli: subscription `condition_id` değil **`asset_id`** ile yapılıyor. Her market'in YES ve NO için iki ayrı `asset_id`'si var.
+
+---
+
+**3. Çok market = çok connection sorunu**
+
+Polymarket WebSocket, `crypto_prices` topic'i için her connection'a yalnızca bir sembol kabul ediyor — yeni sembol eklemek öncekinin üzerine yazıyor. Ancak `market` channel için dinamik subscription destekleniyor — yani **tek bir connection'a birden fazla `asset_id` ekleyebiliyorsun:**
+
+```json
+{
+  "assets_ids": ["yeni_id_1", "yeni_id_2"],
+  "operation": "subscribe"
+}
+```
+
+Bu çok önemli. Yüzlerce market için ayrı connection açmak yerine tek connection üzerinden tüm `asset_id`'leri yönetebiliyoruz.
+
+---
+
+**Düzeltilmesi gereken `trade_stream.rs`:**
+
+```rust
+use crate::types::{RawTrade, TradeSide};
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use std::collections::VecDeque;
+use tokio::sync::mpsc;
+use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+const WS_URL: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
+const BUFFER_SIZE: usize = 50;
+const PING_INTERVAL_SECS: u64 = 10;
+const MAX_ASSETS_PER_CONNECTION: usize = 200; // güvenli üst limit
+
+pub type TradeBuffer = VecDeque<RawTrade>;
+
+// ─── GERÇEK MESAJ FORMATLARI ────────────────────────────
+
+#[derive(Deserialize, Debug)]
+#[serde(tag = "event_type")]
+enum WsEvent {
+    #[serde(rename = "last_trade_price")]
+    LastTradePrice(WsLastTradePrice),
+
+    #[serde(rename = "price_change")]
+    PriceChange(WsPriceChange),
+
+    #[serde(rename = "book")]
+    Book(serde_json::Value), // şimdilik ignore
+
+    #[serde(rename = "best_bid_ask")]
+    BestBidAsk(serde_json::Value), // şimdilik ignore
+
+    #[serde(other)]
+    Unknown,
+}
+
+// Tek trade event
+#[derive(Deserialize, Debug)]
+struct WsLastTradePrice {
+    asset_id: String,
+    market: String,
+    price: String,
+    side: String,
+    size: String,
+    timestamp: String,
+}
+
+// Price change — dizi geliyor
+#[derive(Deserialize, Debug)]
+struct WsPriceChange {
+    market: String,
+    price_changes: Vec<WsPriceChangeItem>,
+    timestamp: String,
+}
+
+#[derive(Deserialize, Debug)]
+struct WsPriceChangeItem {
+    asset_id: String,
+    price: String,
+    size: String,
+    side: String,
+}
+
+// ─── SUBSCRIPTION MESAJI ────────────────────────────────
+
+#[derive(serde::Serialize)]
+struct SubscribeMsg<'a> {
+    assets_ids: &'a [String],
+    #[serde(rename = "type")]
+    msg_type: &'static str,
+    custom_feature_enabled: bool,
+}
+
+#[derive(serde::Serialize)]
+struct DynamicSubscribeMsg<'a> {
+    assets_ids: &'a [String],
+    operation: &'static str,
+}
+
+// ─── BUFFER HELPERS ─────────────────────────────────────
+
+pub fn new_buffer() -> TradeBuffer {
+    VecDeque::with_capacity(BUFFER_SIZE)
+}
+
+pub fn push_trade(buffer: &mut TradeBuffer, trade: RawTrade) {
+    if buffer.len() == BUFFER_SIZE {
+        buffer.pop_front();
+    }
+    buffer.push_back(trade);
+}
+
+// ─── ANA WS CLIENT ──────────────────────────────────────
+// Tek connection — tüm asset_id'leri yönetir
+// MAX_ASSETS_PER_CONNECTION aşılırsa ikinci connection açılır
+
+pub async fn run_stream(
+    asset_ids: Vec<String>,
+    tx: mpsc::Sender<RawTrade>,
+) -> anyhow::Result<()> {
+
+    // Çok fazla asset varsa gruplara böl
+    let chunks: Vec<&[String]> = asset_ids.chunks(MAX_ASSETS_PER_CONNECTION).collect();
+
+    for chunk in chunks {
+        let tx_clone = tx.clone();
+        let ids = chunk.to_vec();
+        tokio::spawn(async move {
+            if let Err(e) = stream_chunk(ids, tx_clone).await {
+                eprintln!("WS stream error: {}", e);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+async fn stream_chunk(
+    asset_ids: Vec<String>,
+    tx: mpsc::Sender<RawTrade>,
+) -> anyhow::Result<()> {
+    let (ws, _) = connect_async(WS_URL).await?;
+    let (mut write, mut read) = ws.split();
+
+    // 1. Subscribe mesajı gönder
+    let sub_msg = SubscribeMsg {
+        assets_ids: &asset_ids,
+        msg_type: "market",
+        custom_feature_enabled: true,
+    };
+    let sub_json = serde_json::to_string(&sub_msg)?;
+    write.send(Message::Text(sub_json)).await?;
+
+    // 2. PING task — her 10 saniyede bir
+    let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(
+                tokio::time::Duration::from_secs(PING_INTERVAL_SECS)
+            ).await;
+            if ping_tx.send(()).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // 3. Ana loop
+    loop {
+        tokio::select! {
+            msg = read.next() => {
+                match msg {
+                    Some(Ok(Message::Text(text))) => {
+                        if let Ok(event) = serde_json::from_str::<WsEvent>(&text) {
+                            if let Some(trade) = parse_event(event) {
+                                let _ = tx.send(trade).await;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Text(t))) if t == "PONG" => {
+                        // heartbeat OK
+                    }
+                    Some(Err(e)) => {
+                        eprintln!("WS error: {}", e);
+                        break;
+                    }
+                    None => break,
+                    _ => {}
+                }
+            }
+            _ = ping_rx.recv() => {
+                write.send(Message::Text("PING".into())).await?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ─── EVENT → RAWTRADE ───────────────────────────────────
+
+fn parse_event(event: WsEvent) -> Option<RawTrade> {
+    match event {
+        WsEvent::LastTradePrice(t) => {
+            let side = if t.side == "BUY" {
+                TradeSide::Buy
+            } else {
+                TradeSide::Sell
+            };
+            Some(RawTrade {
+                market_id: t.market,
+                side,
+                price: t.price.parse().ok()?,
+                size: t.size.parse().ok()?,
+                timestamp: t.timestamp.parse().ok()?,
+            })
+        }
+        WsEvent::PriceChange(pc) => {
+            // price_change dizisinden ilk anlamlı item'ı al
+            // daha gelişmiş versiyonda hepsi işlenebilir
+            let item = pc.price_changes.into_iter().next()?;
+            let side = if item.side == "BUY" {
+                TradeSide::Buy
+            } else {
+                TradeSide::Sell
+            };
+            Some(RawTrade {
+                market_id: pc.market,
+                side,
+                price: item.price.parse().ok()?,
+                size: item.size.parse().ok()?,
+                timestamp: pc.timestamp.parse().ok()?,
+            })
+        }
+        _ => None,
+    }
+}
+```
+
+---
+
+**Özet — ne değişti:**
+
+| Eski (yanlış) | Yeni (doğru) |
+|---|---|
+| URL param ile subscribe | Bağlantı sonrası JSON mesaj |
+| Tek `WsTrade` struct | `event_type` tag'ine göre enum dispatch |
+| Her market ayrı connection | Tek connection, dinamik subscription |
+| PING yok | Her 10s `PING` — yoksa bağlantı kapanıyor |
+| `price` field string değil | `String` → `parse::<f32>()` |
+
+`main.rs`'de de `mpsc::channel` ile trade'leri buffer'a beslemek gerekiyor. Onu da güncelleyeyim mi?

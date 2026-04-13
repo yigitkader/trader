@@ -2,54 +2,186 @@ use crate::types::Market;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
+use serde::Deserializer;
 
-const API_BASE: &str = "https://clob.polymarket.com";
+const GAMMA_API: &str = "https://gamma-api.polymarket.com";
 
-#[derive(Deserialize)]
-struct ApiMarket {
-    condition_id: String,
-    question: String,
-    tokens: Vec<ApiToken>,
-    volume: f64,
-    end_date_iso: String,
+/// Gamma bazen bu alanları **JSON string** olarak döndürüyor: `"[\"Yes\",\"No\"]"`.
+fn deserialize_string_vec<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    use serde::de::Error;
+    let v = serde_json::Value::deserialize(deserializer)?;
+    match v {
+        serde_json::Value::Null => Ok(Vec::new()),
+        serde_json::Value::String(s) => {
+            serde_json::from_str(&s).map_err(|e| Error::custom(format!("stringified json: {e}")))
+        }
+        serde_json::Value::Array(arr) => {
+            let mut out = Vec::with_capacity(arr.len());
+            for item in arr {
+                match item {
+                    serde_json::Value::String(s) => out.push(s),
+                    serde_json::Value::Number(n) => out.push(n.to_string()),
+                    serde_json::Value::Bool(b) => out.push(b.to_string()),
+                    other => out.push(other.to_string()),
+                }
+            }
+            Ok(out)
+        }
+        other => Err(Error::custom(format!(
+            "expected string or array, got {}",
+            other
+        ))),
+    }
 }
 
+/// Gamma listesi: hem hacim hem `endDateIso` hem de `clobTokenIds` burada.
 #[derive(Deserialize)]
-struct ApiToken {
-    outcome: String,
-    price: f32,
+struct GammaMarket {
+    #[serde(rename = "conditionId")]
+    condition_id: String,
+    #[serde(default)]
+    question: Option<String>,
+    #[serde(default, rename = "endDateIso")]
+    end_date_iso: Option<String>,
+    #[serde(default, rename = "volumeNum")]
+    volume_num: Option<f64>,
+    #[serde(default, rename = "spread")]
+    spread: Option<f32>,
+    #[serde(default, rename = "active")]
+    active: Option<bool>,
+    #[serde(default, rename = "closed")]
+    closed: Option<bool>,
+    #[serde(default, rename = "acceptingOrders")]
+    accepting_orders: Option<bool>,
+    #[serde(
+        default,
+        rename = "outcomes",
+        deserialize_with = "deserialize_string_vec"
+    )]
+    outcomes: Vec<String>,
+    #[serde(
+        default,
+        rename = "outcomePrices",
+        deserialize_with = "deserialize_string_vec"
+    )]
+    outcome_prices: Vec<String>,
+    /// outcome index ile paralel (çoğu market için).
+    #[serde(
+        default,
+        rename = "clobTokenIds",
+        deserialize_with = "deserialize_string_vec"
+    )]
+    clob_token_ids: Vec<String>,
 }
 
 pub async fn fetch_markets(client: &Client) -> anyhow::Result<Vec<Market>> {
-    let url = format!("{}/markets", API_BASE);
-    let response: serde_json::Value = client.get(&url).send().await?.json().await?;
-
     let mut markets = Vec::new();
+    let mut offset: u32 = 0;
+    const PAGE: u32 = 1000;
 
-    if let Some(arr) = response["data"].as_array() {
-        for item in arr {
-            let api: ApiMarket = serde_json::from_value(item.clone())?;
+    loop {
+        let url = format!("{}/markets?limit={}&offset={}", GAMMA_API, PAGE, offset);
+        let resp = client
+            .get(&url)
+            .header(reqwest::header::USER_AGENT, "trader/0.1")
+            .send()
+            .await?;
+        let status = resp.status();
+        let body = resp.text().await?;
+        if !status.is_success() {
+            return Err(anyhow::anyhow!(
+                "gamma http {}: {}",
+                status,
+                body.chars().take(400).collect::<String>()
+            ));
+        }
 
-            let yes_price = api
-                .tokens
-                .iter()
-                .find(|t| t.outcome == "Yes")
-                .map(|t| t.price)
+        let rows: Vec<GammaMarket> = serde_json::from_str(&body).map_err(|e| {
+            anyhow::anyhow!(
+                "gamma json parse error: {} | body_prefix={}",
+                e,
+                body.chars().take(400).collect::<String>()
+            )
+        })?;
+        let got = rows.len();
+        if rows.is_empty() {
+            break;
+        }
+
+        for gm in rows {
+            // Aktif + acceptingOrders + kapalı değil gibi temel filtreler (alanlar yoksa yine de düşmeyelim).
+            if gm.closed.unwrap_or(false) {
+                continue;
+            }
+            if gm.active == Some(false) {
+                continue;
+            }
+            if gm.accepting_orders == Some(false) {
+                continue;
+            }
+
+            // Sadece YES/NO marketleri al (mevcut pipeline yes/no varsayıyor).
+            let yes_idx = gm.outcomes.iter().position(|o| o == "Yes");
+            let no_idx = gm.outcomes.iter().position(|o| o == "No");
+            let (Some(yi), Some(ni)) = (yes_idx, no_idx) else {
+                continue;
+            };
+
+            let yes_price = gm
+                .outcome_prices
+                .get(yi)
+                .and_then(|s| s.parse::<f32>().ok())
                 .unwrap_or(0.5);
+            let no_price = gm
+                .outcome_prices
+                .get(ni)
+                .and_then(|s| s.parse::<f32>().ok())
+                .unwrap_or(1.0 - yes_price);
 
-            let no_price = 1.0 - yes_price;
-            let spread = (yes_price + no_price - 1.0).abs();
+            // Gamma bazen spread'i direkt veriyor; yoksa yaklaşık hesapla.
+            let spread = gm
+                .spread
+                .unwrap_or_else(|| (yes_price + no_price - 1.0).abs());
+
+            // WS aboneliği için YES token id (outcome index ile paralelse).
+            let yes_token_id = gm
+                .clob_token_ids
+                .get(yi)
+                .cloned()
+                .filter(|s| !s.is_empty());
+            let no_token_id = gm
+                .clob_token_ids
+                .get(ni)
+                .cloned()
+                .filter(|s| !s.is_empty());
 
             markets.push(Market {
-                id: api.condition_id,
-                question: api.question,
+                id: gm.condition_id,
+                question: gm
+                    .question
+                    .map(|q| q.trim().to_string())
+                    .filter(|q| !q.is_empty())
+                    .unwrap_or_else(|| "(soru yok)".to_string()),
                 yes_price,
                 no_price,
-                volume: api.volume,
+                volume: gm.volume_num,
                 spread,
-                time_to_resolution: parse_ttr(&api.end_date_iso),
+                time_to_resolution: parse_ttr(gm.end_date_iso.as_deref().unwrap_or("")),
                 market_type: crate::types::MarketType::Binary,
+                yes_token_id,
+                no_token_id,
             });
+        }
+
+        if got < PAGE as usize {
+            break;
+        }
+        offset = offset.saturating_add(PAGE);
+        if offset > 50_000 {
+            break;
         }
     }
 

@@ -9,10 +9,15 @@ pub struct Market {
     pub question: String,
     pub yes_price: f32,
     pub no_price: f32,
-    pub volume: f64,
+    /// Gamma `volumeNum` (CLOB `/markets` artık hacim döndürmüyor).
+    pub volume: Option<f64>,
     pub spread: f32,
     pub time_to_resolution: u64,
     pub market_type: MarketType,
+    /// CLOB YES outcome token — `ws/market` aboneliği için (condition_id değil).
+    pub yes_token_id: Option<String>,
+    /// CLOB NO outcome token — emir tarafı için.
+    pub no_token_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,6 +32,7 @@ pub struct RawTrade {
     pub side: TradeSide,
     pub price: f32,
     pub size: f64,
+    /// Kaynak: WS `timestamp` (çoğunlukla milisaniye unix).
     pub timestamp: u64,
 }
 
