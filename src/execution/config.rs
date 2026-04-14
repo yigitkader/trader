@@ -24,6 +24,22 @@ impl ExecutionMode {
     }
 }
 
+/// Limit emrin agresifligi: maker = spread icine, taker = daha hizli dolum (daha yuksek maliyet).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderStyle {
+    Maker,
+    Taker,
+}
+
+impl OrderStyle {
+    fn from_env(raw: &str) -> Self {
+        match raw.to_ascii_lowercase().as_str() {
+            "taker" | "aggressive" | "1" => OrderStyle::Taker,
+            _ => OrderStyle::Maker,
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct ExecutionConfig {
     pub mode: ExecutionMode,
@@ -52,6 +68,13 @@ pub struct ExecutionConfig {
     pub max_open_markets: u16,
     /// Günlük toplam emir tutarı (nominal, USDC cinsinden).
     pub max_daily_notional: f64,
+    pub order_style: OrderStyle,
+    /// Kelly payının bu kadarı uygulanır (0.5 = Half-Kelly).
+    pub kelly_fraction: f32,
+    /// Bu efektif Kelly’de ~1x baz lot (`kelly_fraction` sonrası).
+    pub kelly_target: f32,
+    pub order_size_min: rust_decimal::Decimal,
+    pub order_size_max: rust_decimal::Decimal,
     l2_credentials_complete: bool,
 }
 
@@ -73,6 +96,11 @@ impl std::fmt::Debug for ExecutionConfig {
             .field("max_orders_per_tick", &self.max_orders_per_tick)
             .field("max_open_markets", &self.max_open_markets)
             .field("max_daily_notional", &self.max_daily_notional)
+            .field("order_style", &self.order_style)
+            .field("kelly_fraction", &self.kelly_fraction)
+            .field("kelly_target", &self.kelly_target)
+            .field("order_size_min", &self.order_size_min)
+            .field("order_size_max", &self.order_size_max)
             .finish()
     }
 }
@@ -131,6 +159,28 @@ impl ExecutionConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or(100.0f64);
 
+        let order_style = env_trim("POLYMARKET_ORDER_STYLE")
+            .map(|s| OrderStyle::from_env(&s))
+            .unwrap_or(OrderStyle::Maker);
+
+        let kelly_fraction = env_trim("POLYMARKET_KELLY_FRACTION")
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.5f32);
+
+        let kelly_target = env_trim("POLYMARKET_KELLY_TARGET")
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.08f32);
+
+        let order_size_min = env_trim("POLYMARKET_ORDER_SIZE_MIN")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| "1".parse().expect("literal decimal"));
+
+        let order_size_max = env_trim("POLYMARKET_ORDER_SIZE_MAX")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| "50".parse().expect("literal decimal"));
+
         let l2_credentials_complete =
             api_key.is_some() && api_secret.is_some() && api_passphrase.is_some();
 
@@ -164,6 +214,11 @@ impl ExecutionConfig {
             max_orders_per_tick,
             max_open_markets,
             max_daily_notional,
+            order_style,
+            kelly_fraction,
+            kelly_target,
+            order_size_min,
+            order_size_max,
             l2_credentials_complete,
         }
     }

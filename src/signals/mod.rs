@@ -1,4 +1,5 @@
 pub mod absorption;
+pub mod book_skew;
 pub mod fake_move;
 pub mod panic;
 
@@ -10,5 +11,6 @@ pub fn compute_all(features: &Features) -> SignalSet {
         fake_move: fake_move::compute(features),
         absorption: absorption::compute(features),
         panic: panic::compute(features),
+        book_skew: book_skew::compute(features),
     }
 }

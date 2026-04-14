@@ -15,7 +15,10 @@ impl Ranker {
     }
 
     pub fn push(&mut self, market: ScoredMarket) {
-        if market.edge_score.is_nan() || market.confidence.is_nan() {
+        if market.edge_score.is_nan()
+            || market.confidence.is_nan()
+            || market.annualized_edge.is_nan()
+        {
             return;
         }
         if self.items.len() < TOP_N {
@@ -27,15 +30,15 @@ impl Ranker {
             .iter()
             .enumerate()
             .min_by(|(_, a), (_, b)| {
-                a.edge_score
+                a.annualized_edge
                     .abs()
-                    .partial_cmp(&b.edge_score.abs())
+                    .partial_cmp(&b.annualized_edge.abs())
                     .unwrap_or(std::cmp::Ordering::Equal)
             })
         else {
             return;
         };
-        if market.edge_score.abs() > self.items[worst_i].edge_score.abs() {
+        if market.annualized_edge.abs() > self.items[worst_i].annualized_edge.abs() {
             self.items[worst_i] = market;
         }
     }
@@ -43,9 +46,9 @@ impl Ranker {
     pub fn top_n(&self) -> Vec<&ScoredMarket> {
         let mut items: Vec<&ScoredMarket> = self.items.iter().collect();
         items.sort_by(|a, b| {
-            b.edge_score
+            b.annualized_edge
                 .abs()
-                .partial_cmp(&a.edge_score.abs())
+                .partial_cmp(&a.annualized_edge.abs())
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         items

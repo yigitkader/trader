@@ -5,6 +5,7 @@ mod http_client;
 mod ingestion;
 mod logger;
 mod signals;
+mod strategy_params;
 mod types;
 
 use ingestion::trade_stream::SharedTradeBuffers;
@@ -38,27 +39,21 @@ fn truncate(s: &str, max: usize) -> String {
     if t.chars().count() <= max {
         return t.to_string();
     }
-    let mut out = String::new();
-    for (i, ch) in t.chars().enumerate() {
-        if i >= max.saturating_sub(3) {
-            break;
-        }
-        out.push(ch);
-    }
-    out.push_str("...");
-    out
+    let truncated: String = t.chars().take(max.saturating_sub(3)).collect();
+    format!("{truncated}...")
 }
 
 #[tokio::main]
 async fn main() {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let exec_cfg = execution::ExecutionConfig::load();
+    let strategy = strategy_params::StrategyParams::load();
     let client = http_client::build().expect("HTTP client (reqwest) kurulamadı");
     let mut price_windows: HashMap<String, VecDeque<(u64, f32)>> = HashMap::new();
     let trade_buffers: SharedTradeBuffers = Arc::new(Mutex::new(HashMap::new()));
     let mut ranker = engine::ranker::Ranker::new();
 
-    let mut risk_gate = execution::RiskGate::new();
+    let risk_gate = Arc::new(tokio::sync::Mutex::new(execution::RiskGate::new()));
 
     let hub_tx = ingestion::trade_stream::spawn_trade_hub(Arc::clone(&trade_buffers));
     let mut had_ws_asset_subscriptions = false;
@@ -70,10 +65,11 @@ async fn main() {
     );
     let max_ttr = ingestion::market_meta::max_time_to_resolution_secs();
     println!(
-        "Filtreler: TTR ≥ {}s | spread ≤ {:.2} | hacim ≥ {:.0} (Gamma) | min_edge>0.025{}",
+        "Filtreler: TTR ≥ {}s | spread ≤ {:.2} | hacim ≥ {:.0} (Gamma) | min_edge>{:.3} (TTR ile ölçeklenir){}",
         ingestion::market_meta::MIN_TTR_SECS,
         ingestion::market_meta::MAX_SPREAD,
         ingestion::market_meta::MIN_VOLUME,
+        strategy.min_edge,
         max_ttr.map_or(String::new(), |mx| format!(
             " | max TTR ≤ {}s (~{})",
             mx,
@@ -84,7 +80,10 @@ async fn main() {
     loop {
         tick += 1;
         ranker.clear();
-        risk_gate.begin_tick();
+        {
+            let mut g = risk_gate.lock().await;
+            g.begin_tick();
+        }
 
         // 1. Marketleri çek
         let markets = match ingestion::price_feed::fetch_markets(&client).await {
@@ -135,18 +134,44 @@ async fn main() {
         }
         price_windows.retain(|id, _| tradeable_market_ids.contains(id));
 
-        let trade_buffer_stats = {
+        let trade_snapshot: HashMap<String, VecDeque<RawTrade>> = {
             let g = trade_buffers.lock().await;
-            let mut n_bufs = 0_usize;
-            let mut n_trades = 0_usize;
-            for id in &tradeable_market_ids {
-                if let Some(buf) = g.get(id) {
-                    n_bufs += 1;
-                    n_trades += buf.len();
-                }
-            }
-            (n_bufs, n_trades)
+            tradeable_market_ids
+                .iter()
+                .filter_map(|id| g.get(id).map(|buf| (id.clone(), buf.clone())))
+                .collect()
         };
+        let trade_buffer_stats = (
+            trade_snapshot.len(),
+            trade_snapshot.values().map(|b| b.len()).sum::<usize>(),
+        );
+
+        let book_snapshots: HashMap<String, ingestion::book_feed::BookSnapshot> =
+            if strategy.book_max_tokens_per_tick > 0 {
+                let mut book_tokens: Vec<String> = Vec::new();
+                for m in markets
+                    .iter()
+                    .filter(|m| ingestion::market_meta::is_tradeable(m))
+                {
+                    if let Some(ref t) = m.yes_token_id {
+                        book_tokens.push(t.clone());
+                    }
+                    if let Some(ref t) = m.no_token_id {
+                        book_tokens.push(t.clone());
+                    }
+                }
+                book_tokens.sort();
+                book_tokens.dedup();
+                book_tokens.truncate(strategy.book_max_tokens_per_tick);
+                ingestion::book_feed::fetch_snapshots(
+                    &exec_cfg.clob_base,
+                    &book_tokens,
+                    strategy.book_depth_levels,
+                )
+                .await
+            } else {
+                HashMap::new()
+            };
 
         let id_to_question: HashMap<String, String> = markets
             .iter()
@@ -178,21 +203,26 @@ async fn main() {
             features::momentum::push_price(window, now, market.yes_price);
 
             // 4. Trade buffer (merkezi WS hub doldurur; key = condition_id / `market` alanı)
-            let trades: VecDeque<RawTrade> = trade_buffers
-                .lock()
-                .await
+            let trades: VecDeque<RawTrade> = trade_snapshot
                 .get(&market.id)
                 .cloned()
                 .unwrap_or_default();
 
+            let ob_imb = market
+                .yes_token_id
+                .as_ref()
+                .and_then(|tid| book_snapshots.get(tid))
+                .map(|s| s.imbalance)
+                .unwrap_or(0.5);
+
             // 5. Features hesapla
-            let feats = features::compute_all(market, window, &trades);
+            let feats = features::compute_all(market, window, &trades, &strategy, ob_imb);
 
             // 6. Sinyaller
             let sigs = signals::compute_all(&feats);
 
             // 7. Engine
-            let scored = engine::process(&sigs, market);
+            let scored = engine::process(&sigs, market, &strategy);
 
             max_conf = max_conf.max(scored.confidence);
             max_edge = max_edge.max(scored.edge_score.abs());
@@ -207,6 +237,7 @@ async fn main() {
                     price_at_signal: market.yes_price,
                     confidence: scored.confidence,
                     edge_score: scored.edge_score,
+                    annualized_edge: scored.annualized_edge,
                     decision: scored.decision.clone(),
                     dominant_signal: scored.dominant_signal.clone(),
                     features_snapshot: feats.clone(),
@@ -219,22 +250,60 @@ async fn main() {
                 }
 
                 println!(
-                    "[tick {}] [SINYAL] {} | yes {:.2} | conf {:.2} | edge {:.3} | {:?} | {:?} | mom {:.2} press {:.2}",
+                    "[tick {}] [SINYAL] {} | yes {:.2} | conf {:.2} | edge {:.3} ann {:.2} | {:?} | {:?} | mom {:.2} press {:.2} ob {:.2}",
                     tick,
                     truncate(&market.question, 70),
                     market.yes_price,
                     scored.confidence,
                     scored.edge_score,
+                    scored.annualized_edge,
                     scored.decision,
                     scored.dominant_signal,
                     feats.momentum,
-                    feats.pressure
+                    feats.pressure,
+                    feats.orderbook_imbalance
                 );
 
-                if let Err(e) =
-                    execution::handle_signal(&exec_cfg, &client, market, &scored, tick, &mut risk_gate).await
-                {
-                    eprintln!("[tick {}] execution error: {:#}", tick, e);
+                let snap =
+                    execution::book_snap_for_decision(market, &scored.decision, &book_snapshots);
+
+                if exec_cfg.live_orders_enabled() {
+                    let risk = Arc::clone(&risk_gate);
+                    let cfg = exec_cfg.clone();
+                    let client_spawn = client.clone();
+                    let market_spawn = market.clone();
+                    let scored_spawn = scored.clone();
+                    tokio::spawn(async move {
+                        let mut g = risk.lock().await;
+                        if let Err(e) = execution::handle_signal(
+                            &cfg,
+                            &client_spawn,
+                            &market_spawn,
+                            &scored_spawn,
+                            tick,
+                            &mut *g,
+                            snap,
+                        )
+                        .await
+                        {
+                            eprintln!("[tick {}] execution error: {:#}", tick, e);
+                        }
+                    });
+                } else {
+                    let mut g = risk_gate.lock().await;
+                    if let Err(e) = execution::handle_signal(
+                        &exec_cfg,
+                        &client,
+                        market,
+                        &scored,
+                        tick,
+                        &mut *g,
+                        snap,
+                    )
+                    .await
+                    {
+                        eprintln!("[tick {}] execution error: {:#}", tick, e);
+                    }
                 }
 
                 ranker.push(scored);
@@ -275,7 +344,10 @@ async fn main() {
         }
 
         // Top fırsatlar: yalnızca Skip olmayan (fiyat kapısı + eşik geçen) adaylar
-        println!("--- TOP {} (confidence) ---", engine::ranker::TOP_N);
+        println!(
+            "--- TOP {} (|yıllıklandırılmış edge|) ---",
+            engine::ranker::TOP_N
+        );
         let top = ranker.top_n();
         if top.is_empty() {
             println!(
@@ -293,10 +365,11 @@ async fn main() {
                     .map(fmt_ttr_remaining)
                     .unwrap_or_else(|| "?".into());
                 println!(
-                    "  {:2}. conf={:.3} edge={:.3} {:<8?} | kalan ~{} | {}",
+                    "  {:2}. conf={:.3} edge={:.3} ann={:.3} {:<8?} | kalan ~{} | {}",
                     i + 1,
                     m.confidence,
                     m.edge_score,
+                    m.annualized_edge,
                     m.decision,
                     ttr,
                     q

@@ -3,6 +3,8 @@
 pub mod config;
 mod clob;
 mod dispatch;
+mod pricing;
+mod sizing;
 
 pub use config::ExecutionConfig;
-pub use dispatch::{handle_signal, RiskGate};
+pub use dispatch::{book_snap_for_decision, handle_signal, RiskGate};

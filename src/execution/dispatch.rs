@@ -3,6 +3,9 @@ use std::collections::HashMap;
 
 use crate::execution::clob;
 use crate::execution::config::{ExecutionConfig, ExecutionMode};
+use crate::execution::pricing;
+use crate::execution::sizing;
+use crate::ingestion::book_feed::BookSnapshot;
 use crate::types::{Decision, Market, ScoredMarket, now_secs};
 use reqwest::Client;
 
@@ -102,13 +105,18 @@ pub fn build_plan(market: &Market, scored: &ScoredMarket) -> Option<OrderPlan> {
     })
 }
 
-pub(crate) fn limit_price_for_buy(market: &Market, decision: &Decision, slippage: f32) -> f32 {
-    let base = match decision {
-        Decision::BuyYes => market.yes_price,
-        Decision::BuyNo => market.no_price,
-        Decision::Skip => 0.5,
+/// İşlem göreceği outcome token’ın L2 özeti (maker fiyat + Kelly referansı için).
+pub fn book_snap_for_decision(
+    market: &Market,
+    decision: &Decision,
+    books: &HashMap<String, BookSnapshot>,
+) -> Option<BookSnapshot> {
+    let tid = match decision {
+        Decision::BuyYes => market.yes_token_id.as_ref()?,
+        Decision::BuyNo => market.no_token_id.as_ref()?,
+        Decision::Skip => return None,
     };
-    (base + slippage).clamp(0.01, 0.99)
+    books.get(tid).cloned()
 }
 
 pub async fn handle_signal(
@@ -118,13 +126,32 @@ pub async fn handle_signal(
     scored: &ScoredMarket,
     tick: u64,
     risk: &mut RiskGate,
+    book_snap: Option<BookSnapshot>,
 ) -> anyhow::Result<()> {
     let Some(plan) = build_plan(market, scored) else {
         return Ok(());
     };
 
-    let notional = cfg.order_size.to_string().parse::<f64>().unwrap_or(5.0)
-        * limit_price_for_buy(market, &plan.decision, cfg.price_slippage) as f64;
+    let limit = pricing::limit_price_buy(
+        market,
+        &plan.decision,
+        cfg.price_slippage,
+        cfg.order_style,
+        book_snap.as_ref(),
+    );
+
+    let size = sizing::scaled_order_size(
+        cfg.order_size,
+        &plan.decision,
+        plan.confidence,
+        market,
+        cfg.kelly_fraction,
+        cfg.kelly_target,
+        cfg.order_size_min,
+        cfg.order_size_max,
+    );
+
+    let notional = size.to_string().parse::<f64>().unwrap_or(5.0) * limit as f64;
 
     if cfg.live_orders_enabled() {
         if let Some(reason) = risk.can_order(cfg, &plan.condition_id, notional) {
@@ -135,7 +162,7 @@ pub async fn handle_signal(
             return Ok(());
         }
 
-        let order_id = clob::post_limit_buy(cfg, market, &plan)
+        let order_id = clob::post_limit_buy(cfg, &plan, size, limit)
             .await
             .with_context(|| {
                 format!(
@@ -147,13 +174,15 @@ pub async fn handle_signal(
         risk.record_order(&plan.condition_id, notional);
 
         println!(
-            "[tick {tick}] [execution:LIVE] {:?} | {} | order_id={} | limit≈{:.4} (slip {:.4}) | edge={:.4} conf={:.3}",
+            "[tick {tick}] [execution:LIVE] {:?} | {} | order_id={} | limit≈{:.4} sz={} {:?} | edge={:.4} ann={:.3} conf={:.3}",
             plan.decision,
             plan.question_short,
             order_id,
-            limit_price_for_buy(market, &plan.decision, cfg.price_slippage),
-            cfg.price_slippage,
+            limit,
+            size,
+            cfg.order_style,
             plan.edge_score,
+            scored.annualized_edge,
             plan.confidence
         );
         return Ok(());
@@ -166,12 +195,16 @@ pub async fn handle_signal(
         .unwrap_or_else(|| "YOK (Gamma/CLOB token eksik)".into());
 
     println!(
-        "[tick {tick}] [execution:DRY-RUN] {:?} | {} | yes_mid={:.4} | edge={:.4} conf={:.3} | token={}",
+        "[tick {tick}] [execution:DRY-RUN] {:?} | {} | yes_mid={:.4} | edge={:.4} ann={:.2} conf={:.3} | limit≈{:.4} sz={} {:?} | token={}",
         plan.decision,
         plan.question_short,
         plan.reference_price_yes,
         plan.edge_score,
+        scored.annualized_edge,
         plan.confidence,
+        limit,
+        size,
+        cfg.order_style,
         token
     );
 

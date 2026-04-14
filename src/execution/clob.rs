@@ -15,8 +15,7 @@ use polymarket_client_sdk::types::{Address, ChainId, Decimal, U256};
 use uuid::Uuid;
 
 use super::config::ExecutionConfig;
-use super::dispatch::{limit_price_for_buy, OrderPlan};
-use crate::types::Market;
+use super::dispatch::OrderPlan;
 
 type AuthClobClient = Client<Authenticated<Normal>>;
 
@@ -142,16 +141,19 @@ async fn authenticate_clob(
 }
 
 /// Limit alım (GTC) — outcome token için `Side::Buy`.
-pub async fn post_limit_buy(cfg: &ExecutionConfig, market: &Market, plan: &OrderPlan) -> anyhow::Result<String> {
+pub async fn post_limit_buy(
+    cfg: &ExecutionConfig,
+    plan: &OrderPlan,
+    size: rust_decimal::Decimal,
+    limit_price: f32,
+) -> anyhow::Result<String> {
     let token_str = plan
         .token_id
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("token_id yok (Gamma token alanları boş olabilir)"))?;
     let token_id = U256::from_str(token_str).context("token_id U256 parse")?;
 
-    let limit = limit_price_for_buy(market, &plan.decision, cfg.price_slippage);
-    let price = f32_to_decimal(limit)?;
-    let size = cfg.order_size;
+    let price = f32_to_decimal(limit_price)?;
 
     let signer = build_signer(cfg)?;
     let creds = build_credentials(cfg)?;

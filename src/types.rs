@@ -54,6 +54,13 @@ pub struct Features {
     /// Bu tick’teki WS trade sayısı (pencere boyutu üst sınırlı).
     #[serde(default)]
     pub trade_count: u32,
+    /// L2 bid hacmi / (bid+ask) üst seviyelerde; kitap yoksa 0.5.
+    #[serde(default = "default_half")]
+    pub orderbook_imbalance: f32,
+}
+
+fn default_half() -> f32 {
+    0.5
 }
 
 // ─── SIGNALS ────────────────────────────────────────────
@@ -64,6 +71,9 @@ pub struct SignalSet {
     pub fake_move: f32,
     pub absorption: f32,
     pub panic: f32,
+    /// L2 dengesizliğinden türetilen işaretli skor (−1..1).
+    #[serde(default)]
+    pub book_skew: f32,
 }
 
 // ─── ENGINE OUTPUT ──────────────────────────────────────
@@ -73,16 +83,16 @@ pub struct ScoredMarket {
     pub market_id: String,
     pub confidence: f32,
     pub edge_score: f32,
+    /// Basit yıllıklandırma: `edge_score / max(ttr_yıl, ~1s)`.
+    #[serde(default)]
+    pub annualized_edge: f32,
     pub decision: Decision,
     pub dominant_signal: DominantSignal,
 }
 
 impl PartialEq for ScoredMarket {
     fn eq(&self, other: &Self) -> bool {
-        self.confidence
-            .partial_cmp(&other.confidence)
-            .unwrap()
-            .is_eq()
+        self.confidence.total_cmp(&other.confidence).is_eq()
     }
 }
 
@@ -90,13 +100,13 @@ impl Eq for ScoredMarket {}
 
 impl PartialOrd for ScoredMarket {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        self.confidence.partial_cmp(&other.confidence)
+        Some(self.cmp(other))
     }
 }
 
 impl Ord for ScoredMarket {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.partial_cmp(other).unwrap_or(std::cmp::Ordering::Equal)
+        self.confidence.total_cmp(&other.confidence)
     }
 }
 
@@ -125,6 +135,8 @@ pub struct LogEntry {
     pub price_at_signal: f32,
     pub confidence: f32,
     pub edge_score: f32,
+    #[serde(default)]
+    pub annualized_edge: f32,
     pub decision: Decision,
     pub dominant_signal: DominantSignal,
     pub features_snapshot: Features,
