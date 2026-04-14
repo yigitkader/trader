@@ -6,5 +6,6 @@ mod dispatch;
 mod pricing;
 mod sizing;
 
+pub use clob::ClobSession;
 pub use config::ExecutionConfig;
 pub use dispatch::{book_snap_for_decision, handle_signal, RiskGate};

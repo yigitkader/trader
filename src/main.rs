@@ -10,6 +10,7 @@ mod types;
 
 use ingestion::trade_stream::SharedTradeBuffers;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
@@ -52,8 +53,29 @@ async fn main() {
     let mut price_windows: HashMap<String, VecDeque<(u64, f32)>> = HashMap::new();
     let trade_buffers: SharedTradeBuffers = Arc::new(Mutex::new(HashMap::new()));
     let mut ranker = engine::ranker::Ranker::new();
+    // Tape momentumu: mümkünse CLOB L2 midpoint, yoksa Gamma yes_price.
+    let mut prev_tape_price: HashMap<String, f32> = HashMap::new();
+    // Aynı fingerprint tekrar tekrar loglanmasın diye basit dedup.
+    let mut last_log_fp: HashMap<String, u64> = HashMap::new();
+    let mut last_log_ts: HashMap<String, u64> = HashMap::new();
 
     let risk_gate = Arc::new(tokio::sync::Mutex::new(execution::RiskGate::new()));
+
+    let clob_session: Option<Arc<execution::ClobSession>> =
+        if exec_cfg.live_orders_enabled() {
+            match execution::ClobSession::connect(&exec_cfg).await {
+                Ok(s) => {
+                    println!("CLOB oturumu hazır (tek auth, canlı emirler paylaşır)");
+                    Some(Arc::new(s))
+                }
+                Err(e) => {
+                    eprintln!("CLOB auth başarısız — canlı emirler atılamaz: {e:#}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
     let hub_tx = ingestion::trade_stream::spawn_trade_hub(Arc::clone(&trade_buffers));
     let mut had_ws_asset_subscriptions = false;
@@ -226,11 +248,10 @@ async fn main() {
             }
             analyzed += 1;
 
-            // 3. Price window güncelle
+            // 3. Price window güncelle (tape fiyatı)
             let window = price_windows
                 .entry(market.id.clone())
                 .or_insert_with(VecDeque::new);
-            features::momentum::push_price(window, now, market.yes_price);
 
             // 4. Trade buffer (merkezi WS hub doldurur; key = condition_id / `market` alanı)
             let trades: VecDeque<RawTrade> = trade_snapshot
@@ -243,11 +264,32 @@ async fn main() {
                 .as_ref()
                 .and_then(|tid| book_snapshots.get(tid));
 
+            let tape_price = yes_book
+                .and_then(|b| match (b.best_bid, b.best_ask) {
+                    (Some(bb), Some(ba)) if ba > bb => Some((bb + ba) * 0.5),
+                    _ => None,
+                })
+                .unwrap_or(market.yes_price);
+
+            features::momentum::push_price(window, now, tape_price);
+
             // 5. Features hesapla
-            let feats = features::compute_all(market, window, &trades, &strategy, yes_book);
+            let gamma_tick_delta = prev_tape_price
+                .get(&market.id)
+                .map(|p| tape_price - *p)
+                .unwrap_or(0.0);
+            let feats = features::compute_all(
+                market,
+                window,
+                &trades,
+                &strategy,
+                yes_book,
+                gamma_tick_delta,
+            );
+            prev_tape_price.insert(market.id.clone(), tape_price);
 
             // 6. Sinyaller
-            let sigs = signals::compute_all(&feats);
+            let sigs = signals::compute_all(&feats, &strategy);
 
             // 7. Engine
             let scored = engine::process(&sigs, market, &strategy);
@@ -258,7 +300,13 @@ async fn main() {
             // 8. Sadece anlamlı sinyalleri logla
             if !matches!(scored.decision, types::Decision::Skip) {
                 non_skip += 1;
+                let strength_max = sigs
+                    .fake_move
+                    .abs()
+                    .max(sigs.absorption.abs())
+                    .max(sigs.panic.abs());
                 let entry = types::LogEntry {
+                    log_schema: types::LOG_ENTRY_SCHEMA_VERSION,
                     timestamp: now,
                     market_id: market.id.clone(),
                     market_question: market.question.clone(),
@@ -269,12 +317,53 @@ async fn main() {
                     decision: scored.decision.clone(),
                     dominant_signal: scored.dominant_signal.clone(),
                     features_snapshot: feats.clone(),
+                    signal_snapshot: types::SignalSnapshot {
+                        fake_move: sigs.fake_move,
+                        absorption: sigs.absorption,
+                        panic: sigs.panic,
+                        book_skew: sigs.book_skew,
+                        strength_max,
+                    },
+                    dominance_params: types::DominanceParamsSnapshot {
+                        dominant_mixed_max: strategy.dominant_mixed_max,
+                        dominant_tie_eps: strategy.dominant_tie_eps,
+                    },
+                    labels: types::LogLabels {
+                        schema_version: types::LOG_LABEL_SCHEMA_VERSION,
+                        outcome_yes: None,
+                        forward_return_yes: None,
+                    },
                     order_id: None,
                     limit_price: None,
                 };
 
-                if let Err(e) = logger::writer::write(&entry) {
-                    eprintln!("[tick {}] log error: {}", tick, e);
+                // Per-market fingerprint: küçük oynaklıklar için yuvarla, spam log'u engelle.
+                let fp = {
+                    let mut h = std::collections::hash_map::DefaultHasher::new();
+                    entry.market_id.hash(&mut h);
+                    entry.decision.hash(&mut h);
+                    entry.dominant_signal.hash(&mut h);
+                    // Fiyat ve sinyaller: gürültüye dayanıklı quantize.
+                    ((entry.price_at_signal * 10_000.0) as i64).hash(&mut h);
+                    ((entry.confidence * 10_000.0) as i64).hash(&mut h);
+                    ((entry.edge_score * 10_000.0) as i64).hash(&mut h);
+                    ((entry.signal_snapshot.fake_move * 10_000.0) as i64).hash(&mut h);
+                    ((entry.signal_snapshot.absorption * 10_000.0) as i64).hash(&mut h);
+                    ((entry.signal_snapshot.panic * 10_000.0) as i64).hash(&mut h);
+                    ((entry.signal_snapshot.book_skew * 10_000.0) as i64).hash(&mut h);
+                    h.finish()
+                };
+                let last_fp = last_log_fp.get(&entry.market_id).copied();
+                let last_ts = last_log_ts.get(&entry.market_id).copied().unwrap_or(0);
+                // Aynı fingerprint ise 60sn içinde tekrar yazma.
+                let should_write = last_fp.map_or(true, |p| p != fp) || now.saturating_sub(last_ts) >= 60;
+                if should_write {
+                    if let Err(e) = logger::writer::write(&entry) {
+                        eprintln!("[tick {}] log error: {}", tick, e);
+                    } else {
+                        last_log_fp.insert(entry.market_id.clone(), fp);
+                        last_log_ts.insert(entry.market_id.clone(), now);
+                    }
                 }
 
                 println!(
@@ -296,36 +385,38 @@ async fn main() {
                     execution::book_snap_for_decision(market, &scored.decision, &book_snapshots);
 
                 if exec_cfg.live_orders_enabled() {
-                    let risk = Arc::clone(&risk_gate);
-                    let cfg = exec_cfg.clone();
-                    let client_spawn = client.clone();
-                    let market_spawn = market.clone();
-                    let scored_spawn = scored.clone();
-                    tokio::spawn(async move {
-                        let mut g = risk.lock().await;
-                        if let Err(e) = execution::handle_signal(
-                            &cfg,
-                            &client_spawn,
-                            &market_spawn,
-                            &scored_spawn,
-                            tick,
-                            &mut *g,
-                            snap,
-                        )
-                        .await
-                        {
-                            eprintln!("[tick {}] execution error: {:#}", tick, e);
-                        }
-                    });
+                    if let Some(clob_spawn) = clob_session.clone() {
+                        let risk = Arc::clone(&risk_gate);
+                        let cfg = exec_cfg.clone();
+                        let client_spawn = client.clone();
+                        let market_spawn = market.clone();
+                        let scored_spawn = scored.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = execution::handle_signal(
+                                &cfg,
+                                &client_spawn,
+                                &market_spawn,
+                                &scored_spawn,
+                                tick,
+                                risk.as_ref(),
+                                Some(clob_spawn.as_ref()),
+                                snap,
+                            )
+                            .await
+                            {
+                                eprintln!("[tick {}] execution error: {:#}", tick, e);
+                            }
+                        });
+                    }
                 } else {
-                    let mut g = risk_gate.lock().await;
                     if let Err(e) = execution::handle_signal(
                         &exec_cfg,
                         &client,
                         market,
                         &scored,
                         tick,
-                        &mut *g,
+                        risk_gate.as_ref(),
+                        None,
                         snap,
                     )
                     .await
@@ -337,6 +428,11 @@ async fn main() {
                 ranker.push(scored);
             }
         }
+
+        let fetched_ids: HashSet<String> = markets.iter().map(|m| m.id.clone()).collect();
+        prev_tape_price.retain(|id, _| fetched_ids.contains(id));
+        last_log_fp.retain(|id, _| fetched_ids.contains(id));
+        last_log_ts.retain(|id, _| fetched_ids.contains(id));
 
         // --- Özet satırı ---
         println!(

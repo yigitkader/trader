@@ -7,12 +7,22 @@ use crate::strategy_params::StrategyParams;
 use crate::types::{Features, Market, RawTrade};
 use std::collections::VecDeque;
 
+/// 5 dk pencere momentum’u ile tick başı Gamma mid değişiminden güçlü olanı seçer (işaret korunur).
+pub fn effective_tape_momentum(f: &Features) -> f32 {
+    if f.momentum.abs() >= f.gamma_tick_delta.abs() {
+        f.momentum
+    } else {
+        f.gamma_tick_delta
+    }
+}
+
 pub fn compute_all(
     market: &Market,
     price_window: &VecDeque<(u64, f32)>,
     trades: &VecDeque<RawTrade>,
     strategy: &StrategyParams,
     yes_book: Option<&BookSnapshot>,
+    gamma_tick_delta: f32,
 ) -> Features {
     let (imb, imb_w, spr) = match yes_book {
         Some(b) => (
@@ -26,6 +36,7 @@ pub fn compute_all(
     Features {
         market_id: market.id.clone(),
         momentum: momentum::compute(price_window),
+        gamma_tick_delta,
         pressure: pressure::compute(trades),
         reaction_speed: reaction::compute(price_window, trades),
         time_decay: compute_time_decay(market.time_to_resolution, strategy),

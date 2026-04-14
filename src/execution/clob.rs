@@ -19,6 +19,21 @@ use super::dispatch::OrderPlan;
 
 type AuthClobClient = Client<Authenticated<Normal>>;
 
+/// Tek seferlik CLOB auth + imzacı; canlı emirlerde her POST için yeniden authenticate edilmez.
+pub struct ClobSession {
+    client: AuthClobClient,
+    signer: PrivateKeySigner,
+}
+
+impl ClobSession {
+    pub async fn connect(cfg: &ExecutionConfig) -> anyhow::Result<Self> {
+        let signer = build_signer(cfg)?;
+        let creds = build_credentials(cfg)?;
+        let client = authenticate_clob(cfg, &signer, creds).await?;
+        Ok(Self { client, signer })
+    }
+}
+
 fn sdk_chain(chain_id: u64) -> anyhow::Result<ChainId> {
     match chain_id {
         137 => Ok(POLYGON),
@@ -142,7 +157,7 @@ async fn authenticate_clob(
 
 /// Limit alım (GTC) — outcome token için `Side::Buy`.
 pub async fn post_limit_buy(
-    cfg: &ExecutionConfig,
+    session: &ClobSession,
     plan: &OrderPlan,
     size: rust_decimal::Decimal,
     limit_price: f32,
@@ -155,11 +170,8 @@ pub async fn post_limit_buy(
 
     let price = f32_to_decimal(limit_price)?;
 
-    let signer = build_signer(cfg)?;
-    let creds = build_credentials(cfg)?;
-    let client = authenticate_clob(cfg, &signer, creds).await?;
-
-    let signable = client
+    let signable = session
+        .client
         .limit_order()
         .token_id(token_id)
         .side(Side::Buy)
@@ -170,12 +182,14 @@ pub async fn post_limit_buy(
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let signed = client
-        .sign(&signer, signable)
+    let signed = session
+        .client
+        .sign(&session.signer, signable)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;
 
-    let resp = client
+    let resp = session
+        .client
         .post_order(signed)
         .await
         .map_err(|e| anyhow::anyhow!("{e}"))?;

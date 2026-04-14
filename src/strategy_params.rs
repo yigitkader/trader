@@ -53,6 +53,20 @@ pub struct StrategyParams {
     /// Çoklu sonuç: toplam mid bu kadar 1.0'dan düşükse underround arbitraj ipucu.
     pub multi_arb_sum_low: f32,
     pub multi_arb_sum_high: f32,
+
+    // --- Signal thresholds (tape) ---
+    /// fake_move: |momentum| bunun altındaysa 0 (tape fiyat birimi, 0..1 aralığı).
+    pub fake_momentum_threshold: f32,
+    /// fake_move: reaction_speed bunun altındaysa 0.
+    pub fake_reaction_min: f32,
+    /// panic: |momentum| bunun altındaysa 0.
+    pub panic_spike_threshold: f32,
+
+    // --- Signal thresholds (absorption) ---
+    pub absorption_min_trades: u32,
+    pub absorption_max_momentum: f32,
+    pub absorption_pressure_deadband: f32,
+    pub absorption_pressure_scale: f32,
 }
 
 impl StrategyParams {
@@ -78,6 +92,18 @@ impl StrategyParams {
             longshot_raw_weight: env_f32("POLYMARKET_LONGSHOT_RAW_WEIGHT", 0.35),
             multi_arb_sum_low: env_f32("POLYMARKET_MULTI_ARB_SUM_LOW", 0.98),
             multi_arb_sum_high: env_f32("POLYMARKET_MULTI_ARB_SUM_HIGH", 1.02),
+
+            // Tape thresholds: defaults lowered for L2 midpoint cadence (was too strict with ~2s ticks).
+            fake_momentum_threshold: env_f32("POLYMARKET_FAKE_MOMENTUM_THRESHOLD", 0.002),
+            fake_reaction_min: env_f32("POLYMARKET_FAKE_REACTION_MIN", 0.001),
+            panic_spike_threshold: env_f32("POLYMARKET_PANIC_SPIKE_THRESHOLD", 0.004),
+
+            absorption_min_trades: env_trim("POLYMARKET_ABSORPTION_MIN_TRADES")
+                .and_then(|s| s.parse::<u32>().ok())
+                .unwrap_or(6),
+            absorption_max_momentum: env_f32("POLYMARKET_ABSORPTION_MAX_MOMENTUM", 0.01),
+            absorption_pressure_deadband: env_f32("POLYMARKET_ABSORPTION_PRESSURE_DEADBAND", 0.01),
+            absorption_pressure_scale: env_f32("POLYMARKET_ABSORPTION_PRESSURE_SCALE", 0.35),
         }
     }
 }

@@ -1,29 +1,27 @@
+use crate::features::effective_tape_momentum;
+use crate::strategy_params::StrategyParams;
 use crate::types::Features;
 
 // Buyer-heavy tape + calm mid → seller absorbing (potential YES downside).
 // Seller-heavy tape + calm mid → buyer absorbing (potential YES upside).
 // Returns SIGNED value: positive → bullish YES, negative → bearish YES.
 
-const MIN_TRADES: u32 = 6;
-const MAX_MOMENTUM_FOR_ABSORPTION: f32 = 0.06;
-const PRESSURE_SCALE: f32 = 0.35;
-
-pub fn compute(f: &Features) -> f32 {
-    if f.trade_count < MIN_TRADES {
+pub fn compute(f: &Features, strategy: &StrategyParams) -> f32 {
+    if f.trade_count < strategy.absorption_min_trades {
         return 0.0;
     }
 
     let imbalance = f.pressure - 1.0;
-    if imbalance.abs() < 0.01 {
+    if imbalance.abs() < strategy.absorption_pressure_deadband {
         return 0.0;
     }
 
-    let m = f.momentum.abs();
-    if m >= MAX_MOMENTUM_FOR_ABSORPTION {
+    let m = effective_tape_momentum(f).abs();
+    if m >= strategy.absorption_max_momentum {
         return 0.0;
     }
-    let calm = 1.0 - (m / MAX_MOMENTUM_FOR_ABSORPTION);
-    let strength = (imbalance.abs() / PRESSURE_SCALE).clamp(0.0, 1.0);
+    let calm = 1.0 - (m / strategy.absorption_max_momentum);
+    let strength = (imbalance.abs() / strategy.absorption_pressure_scale).clamp(0.0, 1.0);
 
     // seller pressure (pressure < 1) + calm → buyers absorb → YES likely up → positive
     // buyer pressure (pressure > 1) + calm → sellers absorb → YES likely down → negative

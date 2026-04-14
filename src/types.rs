@@ -66,6 +66,9 @@ pub enum TradeSide {
 pub struct Features {
     pub market_id: String,
     pub momentum: f32,
+    /// Bir önceki tick’teki Gamma YES mid ile fark (tape sinyalleri için; 5 dk momentum 0 iken bile hareket yakalar).
+    #[serde(default)]
+    pub gamma_tick_delta: f32,
     pub pressure: f32,
     pub reaction_speed: f32,
     pub time_decay: f32,
@@ -132,14 +135,14 @@ impl Ord for ScoredMarket {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub enum Decision {
     BuyYes,
     BuyNo,
     Skip,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
 pub enum DominantSignal {
     FakeMove,
     Absorption,
@@ -149,8 +152,67 @@ pub enum DominantSignal {
 
 // ─── LOG ────────────────────────────────────────────────
 
+/// `LogLabels` sürümü; offline araçlar uyumluluk için kontrol eder.
+pub const LOG_LABEL_SCHEMA_VERSION: u32 = 1;
+
+/// `log_schema` alanı — ham sinyal + dominance snapshot içeren satırlar.
+pub const LOG_ENTRY_SCHEMA_VERSION: u32 = 1;
+
+/// Çözüm / forward-return gibi kalibrasyon etiketleri — bot yazarken boş, sonra `merge_outcome_labels` vb. doldurur.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LogLabels {
+    #[serde(default)]
+    pub schema_version: u32,
+    /// Pazar YES olarak kapandı mı (`true` = YES kazandı).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome_yes: Option<bool>,
+    /// Sinyal anından sonra YES mid oransal değişimi (ör. (p1-p0)/p0); offline hesaplanabilir.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub forward_return_yes: Option<f32>,
+}
+
+/// Log satırı anındaki ham sinyaller (`book_skew` scorer’da ayrı ağırlıkla).
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SignalSnapshot {
+    pub fake_move: f32,
+    pub absorption: f32,
+    pub panic: f32,
+    pub book_skew: f32,
+    /// max(|fake_move|, |absorption|, |panic|) — `DominantSignal::Mixed` ile kıyas için.
+    pub strength_max: f32,
+}
+
+/// `dominant_signal` hesabında kullanılan eşikler (log anı; `.env` ile sonradan değişse bile satır self-contained).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DominanceParamsSnapshot {
+    #[serde(default = "default_dominant_mixed_max")]
+    pub dominant_mixed_max: f32,
+    #[serde(default = "default_dominant_tie_eps")]
+    pub dominant_tie_eps: f32,
+}
+
+fn default_dominant_mixed_max() -> f32 {
+    0.05
+}
+
+fn default_dominant_tie_eps() -> f32 {
+    0.02
+}
+
+impl Default for DominanceParamsSnapshot {
+    fn default() -> Self {
+        Self {
+            dominant_mixed_max: default_dominant_mixed_max(),
+            dominant_tie_eps: default_dominant_tie_eps(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEntry {
+    /// 0 = eski satır (signal_snapshot yok sayılmamalı); 1 = tam şema.
+    #[serde(default)]
+    pub log_schema: u32,
     pub timestamp: u64,
     pub market_id: String,
     pub market_question: String,
@@ -162,6 +224,12 @@ pub struct LogEntry {
     pub decision: Decision,
     pub dominant_signal: DominantSignal,
     pub features_snapshot: Features,
+    #[serde(default)]
+    pub signal_snapshot: SignalSnapshot,
+    #[serde(default)]
+    pub dominance_params: DominanceParamsSnapshot,
+    #[serde(default)]
+    pub labels: LogLabels,
     /// Filled when a live order is placed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub order_id: Option<String>,

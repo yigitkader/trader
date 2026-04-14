@@ -1,8 +1,11 @@
 use anyhow::Context;
 use std::collections::HashMap;
 
+use tokio::sync::Mutex;
+
 use crate::execution::clob;
 use crate::execution::config::{ExecutionConfig, ExecutionMode};
+use crate::execution::ClobSession;
 use crate::execution::pricing;
 use crate::execution::sizing;
 use crate::ingestion::book_feed::BookSnapshot;
@@ -77,6 +80,22 @@ impl RiskGate {
         self.orders_this_tick += 1;
         self.daily_notional += notional;
     }
+
+    /// CLOB çağrısından önce limitleri atomik tüket; POST başarısız olursa [`rollback_reservation`] çağır.
+    fn reserve_order_slot(&mut self, cfg: &ExecutionConfig, market_id: &str, notional: f64) -> bool {
+        if self.can_order(cfg, market_id, notional).is_some() {
+            return false;
+        }
+        self.record_order(market_id, notional);
+        true
+    }
+
+    fn rollback_reservation(&mut self, market_id: &str, notional: f64) {
+        self.orders_this_tick = self.orders_this_tick.saturating_sub(1);
+        self.daily_notional = (self.daily_notional - notional).max(0.0);
+        self.last_order_ts.remove(market_id);
+        self.open_markets.remove(market_id);
+    }
 }
 
 fn current_day() -> u32 {
@@ -125,7 +144,8 @@ pub async fn handle_signal(
     market: &Market,
     scored: &ScoredMarket,
     tick: u64,
-    risk: &mut RiskGate,
+    risk: &Mutex<RiskGate>,
+    clob_session: Option<&ClobSession>,
     book_snap: Option<BookSnapshot>,
 ) -> anyhow::Result<()> {
     let Some(plan) = build_plan(market, scored) else {
@@ -148,24 +168,41 @@ pub async fn handle_signal(
     let notional = size.to_string().parse::<f64>().unwrap_or(5.0) * limit as f64;
 
     if cfg.live_orders_enabled() {
-        if let Some(reason) = risk.can_order(cfg, &plan.condition_id, notional) {
-            println!(
-                "[tick {tick}] [execution:BLOCKED] {:?} | {} | sebep: {}",
-                plan.decision, plan.question_short, reason
-            );
-            return Ok(());
+        let session = clob_session.ok_or_else(|| {
+            anyhow::anyhow!("CLOB oturumu yok (canlı emir için başlatılmalı)")
+        })?;
+
+        {
+            let mut g = risk.lock().await;
+            if !g.reserve_order_slot(cfg, &plan.condition_id, notional) {
+                let reason = g
+                    .can_order(cfg, &plan.condition_id, notional)
+                    .unwrap_or("limit");
+                println!(
+                    "[tick {tick}] [execution:BLOCKED] {:?} | {} | sebep: {}",
+                    plan.decision, plan.question_short, reason
+                );
+                return Ok(());
+            }
         }
 
-        let order_id = clob::post_limit_buy(cfg, &plan, size, limit)
+        let post = clob::post_limit_buy(session, &plan, size, limit)
             .await
             .with_context(|| {
                 format!(
                     "CLOB limit alım (tick {tick}, condition {})",
                     plan.condition_id
                 )
-            })?;
+            });
 
-        risk.record_order(&plan.condition_id, notional);
+        let order_id = match post {
+            Ok(id) => id,
+            Err(e) => {
+                let mut g = risk.lock().await;
+                g.rollback_reservation(&plan.condition_id, notional);
+                return Err(e);
+            }
+        };
 
         println!(
             "[tick {tick}] [execution:LIVE] {:?} | {} | order_id={} | limit≈{:.4} sz={} {:?} | edge={:.4} ann={:.3} conf={:.3}",
