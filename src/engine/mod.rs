@@ -1,4 +1,5 @@
 pub mod decision;
+pub mod longshot;
 pub mod ranker;
 pub mod scorer;
 
@@ -8,13 +9,20 @@ use crate::types::{Decision, Market, ScoredMarket, SignalSet};
 const SECS_PER_YEAR: f32 = 365.25 * 86400.0;
 
 pub fn process(signals: &SignalSet, market: &Market, strategy: &StrategyParams) -> ScoredMarket {
-    let raw_score = scorer::compute(signals);
-    let model_prob = scorer::sigmoid(raw_score);
+    let ttr = market.time_to_resolution.max(3600);
+
+    let mut raw = scorer::compute(signals);
+    let scale = (strategy.ttr_edge_ref_secs.max(3600) as f32 / ttr as f32)
+        .powf(strategy.scorer_ttr_scale_exp)
+        .clamp(0.55, 1.95);
+    raw *= scale;
+    raw += longshot::raw_score_delta(market, strategy);
+
+    let model_prob = scorer::sigmoid(raw);
 
     let edge = model_prob - market.yes_price;
     let edge_abs = edge.abs();
 
-    let ttr = market.time_to_resolution.max(3600);
     let ref_secs = strategy.ttr_edge_ref_secs.max(3600) as f32;
     let edge_req = strategy.min_edge * (ttr as f32 / ref_secs).powf(strategy.ttr_edge_exponent);
 
@@ -26,12 +34,12 @@ pub fn process(signals: &SignalSet, market: &Market, strategy: &StrategyParams) 
     let decision = if edge_abs < edge_req {
         Decision::Skip
     } else {
-        let raw = if edge > 0.0 {
+        let raw_dec = if edge > 0.0 {
             Decision::BuyYes
         } else {
             Decision::BuyNo
         };
-        decision::apply_price_gate(raw, market, strategy)
+        decision::apply_price_gate(raw_dec, market, strategy)
     };
 
     ScoredMarket {

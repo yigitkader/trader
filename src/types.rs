@@ -26,6 +26,24 @@ pub enum MarketType {
     MultiOutcome,
 }
 
+/// Gamma’da 3+ sonuçlu piyasalarda fiyat toplamının 1.0’dan sapması (yalnızca tespit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiArbKind {
+    /// Toplam 1’den küçük: teorik Dutch-book (tüm YES ucuz).
+    Underround,
+    /// Toplam 1’den büyük: kitap pahalı.
+    Overround,
+}
+
+#[derive(Debug, Clone)]
+pub struct MultiOutcomeArbHint {
+    pub condition_id: String,
+    pub question: String,
+    pub n_outcomes: usize,
+    pub sum_prices: f32,
+    pub kind: MultiArbKind,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RawTrade {
     pub market_id: String,
@@ -57,6 +75,10 @@ pub struct Features {
     /// L2 bid hacmi / (bid+ask) üst seviyelerde; kitap yoksa 0.5.
     #[serde(default = "default_half")]
     pub orderbook_imbalance: f32,
+    #[serde(default = "default_half")]
+    pub orderbook_imbalance_weighted: f32,
+    #[serde(default)]
+    pub orderbook_spread_l2: f32,
 }
 
 fn default_half() -> f32 {

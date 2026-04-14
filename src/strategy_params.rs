@@ -43,6 +43,16 @@ pub struct StrategyParams {
     pub book_max_tokens_per_tick: usize,
     /// Imbalance için bid/ask tarafında toplanan seviye sayısı.
     pub book_depth_levels: usize,
+    /// Skor öncesi: `raw *= (TTR_REF/ttr)^exp` — kısa vadeli piyasalara öncelik.
+    pub scorer_ttr_scale_exp: f32,
+    /// Ucuz YES + kısa TTR long-shot sömürüsü (NO tarafı).
+    pub longshot_enabled: bool,
+    pub longshot_yes_max: f32,
+    pub longshot_ttr_max_secs: u64,
+    pub longshot_raw_weight: f32,
+    /// Çoklu sonuç: toplam mid bu kadar 1.0'dan düşükse underround arbitraj ipucu.
+    pub multi_arb_sum_low: f32,
+    pub multi_arb_sum_high: f32,
 }
 
 impl StrategyParams {
@@ -59,6 +69,15 @@ impl StrategyParams {
             ttr_edge_exponent: env_f32("POLYMARKET_TTR_EDGE_EXPONENT", 0.5),
             book_max_tokens_per_tick: env_usize("POLYMARKET_BOOK_MAX_TOKENS", 120),
             book_depth_levels: env_usize("POLYMARKET_BOOK_DEPTH_LEVELS", 5).max(1),
+            scorer_ttr_scale_exp: env_f32("POLYMARKET_SCORER_TTR_SCALE_EXP", 0.12),
+            longshot_enabled: env_trim("POLYMARKET_LONGSHOT_ENABLED")
+                .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(true),
+            longshot_yes_max: env_f32("POLYMARKET_LONGSHOT_YES_MAX", 0.06),
+            longshot_ttr_max_secs: env_u64("POLYMARKET_LONGSHOT_TTR_MAX_SECS", 259_200),
+            longshot_raw_weight: env_f32("POLYMARKET_LONGSHOT_RAW_WEIGHT", 0.35),
+            multi_arb_sum_low: env_f32("POLYMARKET_MULTI_ARB_SUM_LOW", 0.98),
+            multi_arb_sum_high: env_f32("POLYMARKET_MULTI_ARB_SUM_HIGH", 1.02),
         }
     }
 }

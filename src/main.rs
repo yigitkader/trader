@@ -86,7 +86,13 @@ async fn main() {
         }
 
         // 1. Marketleri çek
-        let markets = match ingestion::price_feed::fetch_markets(&client).await {
+        let (markets, mut multi_arb_hints) = match ingestion::price_feed::fetch_markets(
+            &client,
+            strategy.multi_arb_sum_low,
+            strategy.multi_arb_sum_high,
+        )
+        .await
+        {
             Ok(m) => m,
             Err(e) => {
                 eprintln!("[tick {}] fetch error: {}", tick, e);
@@ -94,6 +100,30 @@ async fn main() {
                 continue;
             }
         };
+
+        if !multi_arb_hints.is_empty() {
+            multi_arb_hints.sort_by(|a, b| {
+                (b.sum_prices - 1.0)
+                    .abs()
+                    .total_cmp(&(a.sum_prices - 1.0).abs())
+            });
+            println!(
+                "[tick {}] Çoklu-sonuç arbitraj ipuçları (otomatik emir yok): {} adet",
+                tick,
+                multi_arb_hints.len()
+            );
+            for h in multi_arb_hints.iter().take(8) {
+                println!(
+                    "  {:?} | Σmid={:.4} (Δ{:+.4}) | n={} | {} | {}",
+                    h.kind,
+                    h.sum_prices,
+                    h.sum_prices - 1.0,
+                    h.n_outcomes,
+                    truncate(&h.condition_id, 14),
+                    truncate(&h.question, 56)
+                );
+            }
+        }
 
         let summary = ingestion::market_meta::filter_summary(&markets);
 
@@ -208,15 +238,13 @@ async fn main() {
                 .cloned()
                 .unwrap_or_default();
 
-            let ob_imb = market
+            let yes_book = market
                 .yes_token_id
                 .as_ref()
-                .and_then(|tid| book_snapshots.get(tid))
-                .map(|s| s.imbalance)
-                .unwrap_or(0.5);
+                .and_then(|tid| book_snapshots.get(tid));
 
             // 5. Features hesapla
-            let feats = features::compute_all(market, window, &trades, &strategy, ob_imb);
+            let feats = features::compute_all(market, window, &trades, &strategy, yes_book);
 
             // 6. Sinyaller
             let sigs = signals::compute_all(&feats);

@@ -75,6 +75,12 @@ pub struct ExecutionConfig {
     pub kelly_target: f32,
     pub order_size_min: rust_decimal::Decimal,
     pub order_size_max: rust_decimal::Decimal,
+    /// Maker modunda L2 yoksa veya spread çok dar ise emir gönderme.
+    pub maker_strict: bool,
+    /// Doluysa lot, kasanın `bankroll_min_frac`–`bankroll_max_frac` arası USDC payına göre.
+    pub bankroll_usdc: Option<f64>,
+    pub bankroll_max_frac: f32,
+    pub bankroll_min_frac: f32,
     l2_credentials_complete: bool,
 }
 
@@ -101,6 +107,10 @@ impl std::fmt::Debug for ExecutionConfig {
             .field("kelly_target", &self.kelly_target)
             .field("order_size_min", &self.order_size_min)
             .field("order_size_max", &self.order_size_max)
+            .field("maker_strict", &self.maker_strict)
+            .field("bankroll_usdc", &self.bankroll_usdc)
+            .field("bankroll_max_frac", &self.bankroll_max_frac)
+            .field("bankroll_min_frac", &self.bankroll_min_frac)
             .finish()
     }
 }
@@ -181,6 +191,22 @@ impl ExecutionConfig {
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| "50".parse().expect("literal decimal"));
 
+        let maker_strict = env_trim("POLYMARKET_MAKER_STRICT")
+            .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+
+        let bankroll_usdc = env_trim("POLYMARKET_BANKROLL_USDC").and_then(|s| s.parse::<f64>().ok());
+
+        let bankroll_max_frac = env_trim("POLYMARKET_BANKROLL_MAX_FRAC")
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.10f32);
+
+        let bankroll_min_frac = env_trim("POLYMARKET_BANKROLL_MIN_FRAC")
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|v| v.is_finite())
+            .unwrap_or(0.01f32);
+
         let l2_credentials_complete =
             api_key.is_some() && api_secret.is_some() && api_passphrase.is_some();
 
@@ -219,6 +245,10 @@ impl ExecutionConfig {
             kelly_target,
             order_size_min,
             order_size_max,
+            maker_strict,
+            bankroll_usdc,
+            bankroll_max_frac,
+            bankroll_min_frac,
             l2_credentials_complete,
         }
     }

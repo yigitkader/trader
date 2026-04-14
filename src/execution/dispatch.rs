@@ -132,24 +132,18 @@ pub async fn handle_signal(
         return Ok(());
     };
 
-    let limit = pricing::limit_price_buy(
-        market,
-        &plan.decision,
-        cfg.price_slippage,
-        cfg.order_style,
-        book_snap.as_ref(),
-    );
+    let limit = match pricing::limit_price_buy(market, &plan.decision, cfg, book_snap.as_ref()) {
+        Ok(p) => p,
+        Err(reason) => {
+            println!(
+                "[tick {tick}] [execution:SKIP] {:?} | {} | {}",
+                plan.decision, plan.question_short, reason
+            );
+            return Ok(());
+        }
+    };
 
-    let size = sizing::scaled_order_size(
-        cfg.order_size,
-        &plan.decision,
-        plan.confidence,
-        market,
-        cfg.kelly_fraction,
-        cfg.kelly_target,
-        cfg.order_size_min,
-        cfg.order_size_max,
-    );
+    let size = sizing::scaled_order_size(cfg, &plan.decision, plan.confidence, market, limit);
 
     let notional = size.to_string().parse::<f64>().unwrap_or(5.0) * limit as f64;
 

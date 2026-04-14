@@ -1,4 +1,4 @@
-use crate::types::Market;
+use crate::types::{Market, MultiArbKind, MultiOutcomeArbHint};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use reqwest::Client;
 use serde::Deserialize;
@@ -77,8 +77,14 @@ struct GammaMarket {
     clob_token_ids: Vec<String>,
 }
 
-pub async fn fetch_markets(client: &Client) -> anyhow::Result<Vec<Market>> {
+/// İkili piyasalar + 3+ sonuçlu piyasalarda Σfiyat ≟ 1.0 arbitraj ipuçları.
+pub async fn fetch_markets(
+    client: &Client,
+    multi_arb_sum_low: f32,
+    multi_arb_sum_high: f32,
+) -> anyhow::Result<(Vec<Market>, Vec<MultiOutcomeArbHint>)> {
     let mut markets = Vec::new();
+    let mut multi_arbs = Vec::new();
     let mut offset: u32 = 0;
     const PAGE: u32 = 1000;
 
@@ -121,6 +127,47 @@ pub async fn fetch_markets(client: &Client) -> anyhow::Result<Vec<Market>> {
             }
             if gm.accepting_orders == Some(false) {
                 continue;
+            }
+
+            // Çoklu sonuç (≥3): fiyat toplamı 1.0’dan sapınca ipucu (otomatik emir yok).
+            if gm.outcomes.len() >= 3 && gm.outcomes.len() == gm.outcome_prices.len() {
+                let mut prices = Vec::<f32>::new();
+                let mut ok = true;
+                for s in &gm.outcome_prices {
+                    match s.parse::<f32>() {
+                        Ok(p) if p.is_finite() && p >= 0.0 => prices.push(p),
+                        _ => {
+                            ok = false;
+                            break;
+                        }
+                    }
+                }
+                if ok && prices.len() == gm.outcomes.len() {
+                    let sum: f32 = prices.iter().sum();
+                    let q = gm
+                        .question
+                        .as_deref()
+                        .map(|x| x.trim().to_string())
+                        .filter(|x| !x.is_empty())
+                        .unwrap_or_else(|| "(soru yok)".to_string());
+                    if sum < multi_arb_sum_low {
+                        multi_arbs.push(MultiOutcomeArbHint {
+                            condition_id: gm.condition_id.clone(),
+                            question: q.clone(),
+                            n_outcomes: gm.outcomes.len(),
+                            sum_prices: sum,
+                            kind: MultiArbKind::Underround,
+                        });
+                    } else if sum > multi_arb_sum_high {
+                        multi_arbs.push(MultiOutcomeArbHint {
+                            condition_id: gm.condition_id.clone(),
+                            question: q,
+                            n_outcomes: gm.outcomes.len(),
+                            sum_prices: sum,
+                            kind: MultiArbKind::Overround,
+                        });
+                    }
+                }
             }
 
             // Sadece YES/NO marketleri al (mevcut pipeline yes/no varsayıyor).
@@ -189,7 +236,7 @@ pub async fn fetch_markets(client: &Client) -> anyhow::Result<Vec<Market>> {
         }
     }
 
-    Ok(markets)
+    Ok((markets, multi_arbs))
 }
 
 /// ISO 8601 bitiş zamanını UTC'ye çevirip şu ana göre kalan saniye (0 = geçmiş veya parse yok).

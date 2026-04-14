@@ -15,42 +15,76 @@ use rust_decimal::prelude::ToPrimitive;
 pub struct BookSnapshot {
     /// Toplam bid hacminin (bid+ask) içindeki payı, [0,1]. 0.5 = dengeli.
     pub imbalance: f32,
+    /// Fiyat ağırlıklı bid payı: Σ(p·size) / (bid_pv + ask_pv).
+    pub imbalance_weighted: f32,
     pub best_bid: Option<f32>,
     pub best_ask: Option<f32>,
+    /// En iyi ask − en iyi bid (L2).
+    pub spread_abs: Option<f32>,
     pub tick: f32,
 }
 
 const BOOK_CHUNK: usize = 20;
 
 fn snapshot_from_book(book: &OrderBookSummaryResponse, depth: usize) -> BookSnapshot {
-    let bids_vol: f64 = book
-        .bids
-        .iter()
-        .take(depth)
-        .filter_map(|l| l.size.to_f64())
-        .sum();
-    let asks_vol: f64 = book
-        .asks
-        .iter()
-        .take(depth)
-        .filter_map(|l| l.size.to_f64())
-        .sum();
-    let tot = bids_vol + asks_vol;
+    let bids: Vec<_> = book.bids.iter().take(depth).collect();
+    let asks: Vec<_> = book.asks.iter().take(depth).collect();
+
+    let mut buy_vol = 0.0_f64;
+    let mut sell_vol = 0.0_f64;
+    let mut bid_pv = 0.0_f64;
+    let mut ask_pv = 0.0_f64;
+
+    for l in &bids {
+        if let (Some(p), Some(sz)) = (l.price.to_f64(), l.size.to_f64()) {
+            buy_vol += sz;
+            bid_pv += p * sz;
+        }
+    }
+    for l in &asks {
+        if let (Some(p), Some(sz)) = (l.price.to_f64(), l.size.to_f64()) {
+            sell_vol += sz;
+            ask_pv += p * sz;
+        }
+    }
+
+    let tot = buy_vol + sell_vol;
     let imbalance = if tot < 1e-12 {
         0.5
     } else {
-        (bids_vol / tot) as f32
+        (buy_vol / tot) as f32
     };
 
-    let best_bid = book.bids.first().and_then(|l| l.price.to_f32());
-    let best_ask = book.asks.first().and_then(|l| l.price.to_f32());
+    let pv_tot = bid_pv + ask_pv;
+    let imbalance_weighted = if pv_tot < 1e-12 {
+        0.5
+    } else {
+        (bid_pv / pv_tot) as f32
+    };
+
+    let best_bid = bids
+        .iter()
+        .filter_map(|l| l.price.to_f32())
+        .max_by(|a, b| a.total_cmp(b));
+    let best_ask = asks
+        .iter()
+        .filter_map(|l| l.price.to_f32())
+        .min_by(|a, b| a.total_cmp(b));
+
+    let spread_abs = match (best_bid, best_ask) {
+        (Some(bb), Some(ba)) if ba > bb => Some(ba - bb),
+        _ => None,
+    };
+
     let tick_d: Decimal = book.tick_size.into();
     let tick = tick_d.to_f32().filter(|t| t.is_finite()).unwrap_or(0.01);
 
     BookSnapshot {
         imbalance,
+        imbalance_weighted,
         best_bid,
         best_ask,
+        spread_abs,
         tick,
     }
 }
