@@ -80,13 +80,13 @@ def main() -> int:
 
     use_steps = args.horizon is None
 
-    # Per market: time series (timestamp[], price[])
+    # Per market: time series (timestamp[], price[]) — tape_price varsa onu kullan.
     per_market_ts: dict[str, list[int]] = defaultdict(list)
     per_market_p: dict[str, list[float]] = defaultdict(list)
     for r in rows:
         mid = r.get("market_id")
         ts = int(r.get("timestamp", 0) or 0)
-        p = float(r.get("price_at_signal", 0.0) or 0.0)
+        p = float(r.get("tape_price", 0.0) or 0.0) or float(r.get("price_at_signal", 0.0) or 0.0)
         if isinstance(mid, str) and mid and ts > 0 and p > 0:
             per_market_ts[mid].append(ts)
             per_market_p[mid].append(p)
@@ -108,7 +108,7 @@ def main() -> int:
             n_total += 1
             mid = r.get("market_id")
             ts0 = int(r.get("timestamp", 0) or 0)
-            p0 = float(r.get("price_at_signal", 0.0) or 0.0)
+            p0 = float(r.get("tape_price", 0.0) or 0.0) or float(r.get("price_at_signal", 0.0) or 0.0)
             if not (isinstance(mid, str) and mid and ts0 > 0 and p0 > 0):
                 out.write(json.dumps(r, ensure_ascii=False) + "\n")
                 continue

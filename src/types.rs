@@ -135,7 +135,7 @@ impl Ord for ScoredMarket {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize, Hash, PartialEq, Eq)]
 pub enum Decision {
     BuyYes,
     BuyNo,
@@ -217,6 +217,10 @@ pub struct LogEntry {
     pub market_id: String,
     pub market_question: String,
     pub price_at_signal: f32,
+    /// Tape fiyatı: mümkünse L2 midpoint (best_bid/best_ask), yoksa Gamma yes_price.
+    /// forward_return etiketlemede tercih edilir (Gamma yuvarlaması nedeniyle 0 dönüşleri azaltır).
+    #[serde(default)]
+    pub tape_price: f32,
     pub confidence: f32,
     pub edge_score: f32,
     #[serde(default)]

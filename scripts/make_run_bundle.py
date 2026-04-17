@@ -37,7 +37,8 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="Run bundle oluşturur (runs/ altında)")
     ap.add_argument("--input", type=Path, default=Path("signals.jsonl"))
     ap.add_argument("--runs-dir", type=Path, default=Path("runs"))
-    ap.add_argument("--steps", default="3,10", help="virgülle steps listesi (varsayılan 3,10)")
+    ap.add_argument("--steps", default="10,30,60", help="virgülle steps listesi (varsayılan 10,30,60)")
+    ap.add_argument("--policy-cost", type=float, default=0.01, help="policy_grid / tune_policy için cost (örn 0.01=1%%)")
     args = ap.parse_args()
 
     root = Path.cwd()
@@ -95,6 +96,28 @@ def main() -> int:
             print(cal, file=sys.stderr)
             return rc2
         print(f"  - wrote: calibrate_next{s}.txt")
+
+        # policy_grid çıktısı da kaydet (kâr policy tuning için)
+        rc3, pol = run(
+            ["python3", "scripts/policy_grid.py", "--file", str(out_jsonl), "--cost", str(args.policy_cost)],
+            cwd=root,
+        )
+        (out_dir / f"policy_grid_next{s}.txt").write_text(pol, encoding="utf-8")
+        if rc3 != 0:
+            print(pol, file=sys.stderr)
+            return rc3
+        print(f"  - wrote: policy_grid_next{s}.txt")
+
+    # tune_policy: en iyi horizon + dominant allowlist önerisi
+    rc4, tune = run(
+        ["python3", "scripts/tune_policy.py", "--run-dir", str(out_dir), "--cost", str(args.policy_cost)],
+        cwd=root,
+    )
+    (out_dir / "policy_recommendation.txt").write_text(tune, encoding="utf-8")
+    if rc4 != 0:
+        print(tune, file=sys.stderr)
+        return rc4
+    print("  - wrote: policy_recommendation.txt")
 
     print("\nTamam. Sonuç dosyaları:")
     for p in sorted(out_dir.iterdir()):

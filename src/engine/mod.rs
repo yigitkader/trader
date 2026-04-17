@@ -31,7 +31,7 @@ pub fn process(signals: &SignalSet, market: &Market, strategy: &StrategyParams) 
 
     let dominant_signal = decision::dominant(signals, strategy);
 
-    let decision = if edge_abs < edge_req {
+    let mut decision = if edge_abs < edge_req {
         Decision::Skip
     } else {
         let raw_dec = if edge > 0.0 {
@@ -41,6 +41,11 @@ pub fn process(signals: &SignalSet, market: &Market, strategy: &StrategyParams) 
         };
         decision::apply_price_gate(raw_dec, market, strategy)
     };
+
+    // Dominant-signal allowlist policy (profit-focused proxy): skip disallowed regimes.
+    if !matches!(decision, Decision::Skip) && !strategy.dominant_allowed(&dominant_signal) {
+        decision = Decision::Skip;
+    }
 
     ScoredMarket {
         market_id: market.id.clone(),

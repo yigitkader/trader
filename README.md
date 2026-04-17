@@ -8,6 +8,8 @@ python3 scripts/make_run_bundle.py
 python3 scripts/make_run_bundle.py --steps 3,10,30
 ```
 
+`make_run_bundle.py` ayrıca her ufuk için `policy_grid_next{N}.txt` ve otomatik öneri `policy_recommendation.txt` üretir.
+
 ## Manuel (gerekirse)
 
 ```bash

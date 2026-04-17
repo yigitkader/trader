@@ -16,6 +16,13 @@ use tokio::sync::Mutex;
 use tokio::time::{sleep, Duration};
 use types::{now_secs, RawTrade};
 
+#[derive(Clone)]
+struct PaperPosition {
+    decision: types::Decision,
+    entry_tape_price: f32,
+    obs: u32,
+}
+
 const TICK_SECS: u64 = 2;
 
 /// Kalan süre (Gamma `endDateIso` → `Market.time_to_resolution`).
@@ -58,6 +65,8 @@ async fn main() {
     // Aynı fingerprint tekrar tekrar loglanmasın diye basit dedup.
     let mut last_log_fp: HashMap<String, u64> = HashMap::new();
     let mut last_log_ts: HashMap<String, u64> = HashMap::new();
+    // Paper pozisyonlar (dry-run / analiz için): entry + observation sayacı.
+    let mut paper_pos: HashMap<String, PaperPosition> = HashMap::new();
 
     let risk_gate = Arc::new(tokio::sync::Mutex::new(execution::RiskGate::new()));
 
@@ -311,6 +320,7 @@ async fn main() {
                     market_id: market.id.clone(),
                     market_question: market.question.clone(),
                     price_at_signal: market.yes_price,
+                    tape_price,
                     confidence: scored.confidence,
                     edge_score: scored.edge_score,
                     annualized_edge: scored.annualized_edge,
@@ -381,6 +391,60 @@ async fn main() {
                     feats.orderbook_imbalance
                 );
 
+                // --- Paper exit policy: next-N observation horizon (proxy analiz: next60 en iyi) ---
+                // Not: Bu sadece dry-run / analiz içindir. Live exit (SELL) daha sonra bu state'e bağlanacak.
+                if !exec_cfg.live_orders_enabled() {
+                    match scored.decision {
+                        types::Decision::BuyYes | types::Decision::BuyNo => {
+                            let e = paper_pos.entry(market.id.clone()).or_insert(PaperPosition {
+                                decision: scored.decision.clone(),
+                                entry_tape_price: tape_price,
+                                obs: 0,
+                            });
+                            // Eğer yön değiştiyse "flip exit" gibi davran: pozisyonu kapatıp yeni entry başlat.
+                            if e.decision != scored.decision {
+                                let pnl = match e.decision {
+                                    types::Decision::BuyYes => tape_price - e.entry_tape_price,
+                                    types::Decision::BuyNo => e.entry_tape_price - tape_price,
+                                    types::Decision::Skip => 0.0,
+                                };
+                                println!(
+                                    "[tick {tick}] [PAPER:EXIT-FLIP] {:?} -> {:?} | {} | Δtape={:+.4} over {} obs",
+                                    e.decision,
+                                    scored.decision,
+                                    truncate(&market.question, 56),
+                                    pnl,
+                                    e.obs
+                                );
+                                *e = PaperPosition {
+                                    decision: scored.decision.clone(),
+                                    entry_tape_price: tape_price,
+                                    obs: 0,
+                                };
+                            } else {
+                                e.obs = e.obs.saturating_add(1);
+                                if e.obs >= strategy.exit_after_obs {
+                                    let pnl = match e.decision {
+                                        types::Decision::BuyYes => tape_price - e.entry_tape_price,
+                                        types::Decision::BuyNo => e.entry_tape_price - tape_price,
+                                        types::Decision::Skip => 0.0,
+                                    };
+                                    println!(
+                                        "[tick {tick}] [PAPER:EXIT-HORIZON] {:?} | {} | Δtape={:+.4} over {} obs (exit_after_obs={})",
+                                        e.decision,
+                                        truncate(&market.question, 56),
+                                        pnl,
+                                        e.obs,
+                                        strategy.exit_after_obs
+                                    );
+                                    paper_pos.remove(&market.id);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 let snap =
                     execution::book_snap_for_decision(market, &scored.decision, &book_snapshots);
 
@@ -433,6 +497,7 @@ async fn main() {
         prev_tape_price.retain(|id, _| fetched_ids.contains(id));
         last_log_fp.retain(|id, _| fetched_ids.contains(id));
         last_log_ts.retain(|id, _| fetched_ids.contains(id));
+        paper_pos.retain(|id, _| fetched_ids.contains(id));
 
         // --- Özet satırı ---
         println!(
