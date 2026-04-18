@@ -12,6 +12,14 @@ pub fn process(signals: &SignalSet, market: &Market, strategy: &StrategyParams) 
     let ttr = market.time_to_resolution.max(3600);
 
     let mut raw = scorer::compute(signals);
+
+    // Contrarian inversion: gerçek outcome analizi FakeMove/Panic sinyallerinin
+    // sistematik olarak ters yönde çalıştığını gösterdi (win_rate<30% BuyYes'te).
+    // POLYMARKET_SCORE_INVERT=1 ile ham skor negatife çevrilerek düzeltilir.
+    if strategy.score_invert {
+        raw = -raw;
+    }
+
     let scale = (strategy.ttr_edge_ref_secs.max(3600) as f32 / ttr as f32)
         .powf(strategy.scorer_ttr_scale_exp)
         .clamp(0.55, 1.95);

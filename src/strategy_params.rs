@@ -119,6 +119,11 @@ pub struct StrategyParams {
     // --- Exit horizon (paper policy / future live exit) ---
     /// next-N observation horizon; dedup dostu. Default: 60 (proxy analizinde en iyi).
     pub exit_after_obs: u32,
+
+    // --- Score inversion (contrarian mode) ---
+    /// Ham skoru negatife cevir: FakeMove/Panic gibi sinyaller BuyYes yerine BuyNo uretir.
+    /// Gercek outcome analizinde bu sinyaller ters yonde calistigindan varsayilan: true.
+    pub score_invert: bool,
 }
 
 impl StrategyParams {
@@ -163,6 +168,10 @@ impl StrategyParams {
             absorption_pressure_scale: env_f32("POLYMARKET_ABSORPTION_PRESSURE_SCALE", 0.35),
 
             exit_after_obs: env_u32("POLYMARKET_EXIT_AFTER_OBS", 60),
+
+            score_invert: env_trim("POLYMARKET_SCORE_INVERT")
+                .map(|s| matches!(s.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+                .unwrap_or(false),
         }
     }
 }
