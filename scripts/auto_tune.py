@@ -6,15 +6,17 @@ Adimlar:
   1. fetch_prices_history.py  → data/prices/ altina gercek fiyat gecmisini indir
   2. label_with_realprices.py → signals_reallabeled.jsonl olustur
   3. Gercek outcome ile per-(dominant, direction) EV hesapla
-  4. Optimal policy bul (en yuksek EV'li dominant + yon kombinasyonu)
-  5. .env dosyasini guncelle (sadece policy satirlari; API anahtarlarina dokunma)
-  6. Ozet raporu kaydet: runs/auto_tune_<ts>.txt
+  4. [Opsiyonel] winner_trades.jsonl varsa top trader market karakteristiklerini analiz et
+  5. Optimal policy bul (en yuksek EV'li dominant + yon kombinasyonu)
+  6. .env dosyasini guncelle (sadece policy satirlari; API anahtarlarina dokunma)
+  7. Ozet raporu kaydet: runs/auto_tune_<ts>.txt
 
 Kullanim:
   python3 scripts/auto_tune.py
   python3 scripts/auto_tune.py --input runs/2026-04-16_205945/signals.jsonl
   python3 scripts/auto_tune.py --dry-run       # .env yazma, sadece analiz goster
   python3 scripts/auto_tune.py --cost 0.02     # %2 komisyon varsayimi
+  python3 scripts/auto_tune.py --with-winners  # fetch_top_traders + build_winner_dataset da calistir
 """
 
 from __future__ import annotations
@@ -30,6 +32,8 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parent.parent
 
+WINNER_FILE   = ROOT / "data" / "winner_trades.jsonl"
+
 # EV esigi: bu degerden dusuk sinyalleri engelle
 EV_MIN_THRESHOLD = 0.02   # %2 minimum EV gerekli
 
@@ -40,6 +44,9 @@ PATCHABLE_KEYS = {
     "POLYMARKET_SCORE_INVERT",
     "POLYMARKET_MIN_EDGE",
     "POLYMARKET_EXIT_DIRECTION",
+    "POLYMARKET_MIN_OUTCOME_MID",
+    "POLYMARKET_MAX_OUTCOME_MID",
+    "POLYMARKET_MAX_TTR_SECS",
 }
 
 
@@ -73,6 +80,88 @@ def load_labeled(path: Path) -> list[dict[str, Any]]:
                 except json.JSONDecodeError:
                     pass
     return rows
+
+
+# ---------------------------------------------------------------------------
+# Top trader winner analizi
+# ---------------------------------------------------------------------------
+
+def analyze_winner_trades(winner_file: Path, cost: float) -> dict[str, Any] | None:
+    """
+    winner_trades.jsonl'daki top trader islemlerini analiz eder.
+    Kazanan trade'lerin market karakteristiklerini cikarir.
+    Doner: market_filter onerileri (price_range, ttr_max, win_rate).
+    """
+    if not winner_file.exists():
+        return None
+
+    rows: list[dict[str, Any]] = []
+    with winner_file.open(encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+
+    labeled = [r for r in rows if r.get("won") is not None]
+    if len(labeled) < 10:
+        return None
+
+    total     = len(labeled)
+    won_rows  = [r for r in labeled if r.get("won") == 1]
+    win_rate  = len(won_rows) / total
+
+    total_pnl = sum(r.get("profit_usdc") or 0 for r in labeled)
+    total_vol = sum(r.get("usdc_size") or 0 for r in labeled)
+
+    # Kazanan trade'lerin fiyat dagilimi
+    won_prices = [r["yes_price_at_entry"] for r in won_rows
+                  if r.get("yes_price_at_entry") is not None]
+    lost_prices = [r["yes_price_at_entry"] for r in labeled
+                   if r.get("won") == 0 and r.get("yes_price_at_entry") is not None]
+
+    def pct(lst: list[float], p: int) -> float:
+        if not lst:
+            return 0.5
+        s = sorted(lst)
+        idx = int(len(s) * p / 100)
+        return s[min(idx, len(s)-1)]
+
+    # Kazananlarin price level dagilimi
+    price_buckets: dict[str, dict] = defaultdict(lambda: {"w": 0, "n": 0})
+    for r in labeled:
+        pl = r.get("market_features", {}).get("price_level", "mid")
+        won = r.get("won", 0)
+        price_buckets[pl]["n"] += 1
+        price_buckets[pl]["w"] += int(won)
+
+    best_price_level = max(
+        price_buckets.items(),
+        key=lambda x: (x[1]["w"] / max(x[1]["n"], 1))
+    )[0] if price_buckets else "mid"
+
+    # Fiyat araligini belirle (kazananlar penceresi)
+    if won_prices:
+        price_min = round(pct(won_prices, 10), 2)
+        price_max = round(pct(won_prices, 90), 2)
+    else:
+        price_min, price_max = 0.05, 0.95
+
+    return {
+        "total_trades":     total,
+        "win_rate":         round(win_rate, 4),
+        "total_pnl":        round(total_pnl, 2),
+        "total_volume":     round(total_vol, 2),
+        "best_price_level": best_price_level,
+        "recommended_price_min": max(0.03, price_min),
+        "recommended_price_max": min(0.97, price_max),
+        "price_buckets":    {k: {"n": v["n"], "win_rate": round(v["w"]/max(v["n"],1), 3)}
+                             for k, v in price_buckets.items()},
+        "won_price_p10":    round(pct(won_prices, 10), 3) if won_prices else None,
+        "won_price_p90":    round(pct(won_prices, 90), 3) if won_prices else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -275,6 +364,7 @@ def build_report(
     policy: dict[str, Any],
     cost: float,
     labeled_path: Path,
+    winner_analysis: dict[str, Any] | None = None,
 ) -> str:
     lines: list[str] = []
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -318,6 +408,26 @@ def build_report(
         f"  POLYMARKET_TRADE_DOMINANT_ALLOW={','.join(policy['allowed_dominants']) or 'none'}",
         f"  POLYMARKET_MIN_EDGE={policy['min_edge']}",
     ]
+
+    if winner_analysis:
+        wa = winner_analysis
+        lines += [
+            "",
+            "--- Top trader market analizi ---",
+            f"  Toplam trade    : {wa['total_trades']}",
+            f"  Kazanma orani   : {wa['win_rate']:.1%}",
+            f"  Toplam PnL      : ${wa['total_pnl']:,.0f}",
+            f"  En iyi fiyat    : {wa['best_price_level']}",
+        ]
+        for pl, info in wa.get("price_buckets", {}).items():
+            lines.append(f"    {pl:15s} n={info['n']:4d}  win={info['win_rate']:.1%}")
+        lines += [
+            "",
+            "  Onerilen market filtresi (top trader kazanan fiyat penceresi):",
+            f"    POLYMARKET_MIN_OUTCOME_MID={wa['recommended_price_min']}",
+            f"    POLYMARKET_MAX_OUTCOME_MID={wa['recommended_price_max']}",
+        ]
+
     return "\n".join(lines)
 
 
@@ -341,6 +451,10 @@ def main() -> int:
                     help="fetch_prices_history adimini atla (data/prices/ zaten doluysa)")
     ap.add_argument("--skip-label", action="store_true",
                     help="label_with_realprices adimini atla (labeled dosya varsa)")
+    ap.add_argument("--with-winners", action="store_true",
+                    help="Top trader verisi de cek ve analiz et (fetch_top_traders + build_winner)")
+    ap.add_argument("--skip-winners", action="store_true",
+                    help="Winner analizi tamamen atla")
     args = ap.parse_args()
 
     # Kaynak bul
@@ -388,6 +502,17 @@ def main() -> int:
     else:
         print(f"\n[auto_tune] Label atlandi (mevcut: {labeled_path})")
 
+    # --- Adim 2b: Top trader verisi (opsiyonel) ---
+    if args.with_winners:
+        run_step(
+            [sys.executable, "scripts/fetch_top_traders.py", "--days", "7"],
+            "Top trader trade'leri indiriliyor",
+        )
+        run_step(
+            [sys.executable, "scripts/build_winner_dataset.py", "--days", "7"],
+            "Winner dataset olusturuluyor",
+        )
+
     # --- Adim 3: EV analizi ---
     print("\n[auto_tune] EV analizi yapiliyor...")
     rows = load_labeled(labeled_path)
@@ -403,8 +528,20 @@ def main() -> int:
     flipped_evs = compute_flipped_ev(ev_table)
     policy      = select_policy(ev_table, flipped_evs, args.cost, args.ev_min)
 
+    # --- Adim 3b: Winner analizi ---
+    winner_analysis: dict[str, Any] | None = None
+    if not args.skip_winners and WINNER_FILE.exists():
+        print("\n[auto_tune] Top trader winner analizi...")
+        winner_analysis = analyze_winner_trades(WINNER_FILE, args.cost)
+        if winner_analysis:
+            print(f"  {winner_analysis['total_trades']} trade  "
+                  f"win={winner_analysis['win_rate']:.1%}  "
+                  f"PnL=${winner_analysis['total_pnl']:,.0f}")
+        else:
+            print("  Yetersiz winner data (atlandi)")
+
     # --- Adim 4: Rapor ---
-    report = build_report(ev_table, flipped_evs, policy, args.cost, labeled_path)
+    report = build_report(ev_table, flipped_evs, policy, args.cost, labeled_path, winner_analysis)
     print("\n" + report)
 
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -419,10 +556,15 @@ def main() -> int:
         return 0
 
     env_updates: dict[str, str] = {
-        "POLYMARKET_SCORE_INVERT":            str(int(policy["score_invert"])),
-        "POLYMARKET_TRADE_DOMINANT_ALLOW":    ",".join(policy["allowed_dominants"]),
-        "POLYMARKET_MIN_EDGE":                str(policy["min_edge"]),
+        "POLYMARKET_SCORE_INVERT":         str(int(policy["score_invert"])),
+        "POLYMARKET_TRADE_DOMINANT_ALLOW": ",".join(policy["allowed_dominants"]),
+        "POLYMARKET_MIN_EDGE":             str(policy["min_edge"]),
     }
+
+    # Winner analizi varsa market filtrelerini guncelle
+    if winner_analysis and winner_analysis.get("total_trades", 0) >= 30:
+        env_updates["POLYMARKET_MIN_OUTCOME_MID"] = str(winner_analysis["recommended_price_min"])
+        env_updates["POLYMARKET_MAX_OUTCOME_MID"] = str(winner_analysis["recommended_price_max"])
 
     if args.dry_run:
         print("\n[DRY RUN] .env yazilmadi. Onerilen degisiklikler:")
@@ -438,7 +580,8 @@ def main() -> int:
             return 1
 
     print("\n[auto_tune] Tamamlandi.")
-    print("Sonraki adim: cargo run  (dry_run modunda yeni sinyaller topla)")
+    print("Bot'u calistirmak icin: cargo run")
+    print("Sonraki otomatik tuning: python3 scripts/auto_tune.py --with-winners")
     return 0
 
 
