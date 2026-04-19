@@ -83,3 +83,67 @@ runs/
   <tarih>/signals.jsonl        — Bot sinyal logu
   auto_tune_<tarih>.txt        — Tuning raporu
 ```
+
+
+
+
+
+--------------------------------------------------
+
+
+Kullanım döngüsü
+HAFTA 1
+  ├─ 1. cargo run          (bot çalışır, sinyal toplar, log yazar)
+  │      ↓ runs/sinyal.jsonl dolmaya başlar
+  │
+  └─ 2-3 gün sonra (yeterli veri biriktikten sonra):
+         python3 scripts/auto_tune.py --with-winners
+              ↓ Analiz yapar
+              ↓ .env'i günceller (hangi sinyal karlı?)
+              ↓ Artık bot daha iyi karar verir
+HAFTA 2
+  ├─ cargo run             (güncel .env ile çalışır)
+  └─ hafta sonu tekrar auto_tune
+Adım adım
+1. Botu başlat (her gün çalışır)
+cd /Users/dream/Desktop/trader
+cargo run
+Bot durduğunda sinyal logları runs/<tarih>/signals.jsonl'e kaydedilmiştir.
+
+2. Botu arka planda çalıştır (isteğe bağlı)
+Terminal kapansa bile çalışmaya devam etmesi için:
+
+nohup cargo run > logs/bot.log 2>&1 &
+3. Yeterli veri biriktikten sonra Python'u çalıştır
+Ne zaman? runs/ klasöründe toplam 500+ sinyal biriktikten sonra.
+
+python3 scripts/auto_tune.py --with-winners
+Bu komut:
+
+Top trader trade'lerini çeker
+Kendi sinyallerini gerçek sonuçlarla karşılaştırır
+.env'i otomatik günceller → bot bir sonraki çalışmada daha iyi kararlar verir
+4. Raporları gör
+python3 scripts/summarize_runs.py
+tarih             kaynak             EV_normal  EV_flip  invert  dominant   min_edge
+2026-04-18 17:07  2026-04-16_205945  -0.0449    +0.0349  1       FakeMove   0.02
+Özet tablo
+Komut	Ne zaman?	Süre
+cargo run
+Her gün / sürekli
+Süresiz (döngü)
+auto_tune.py --with-winners
+Haftada 1 kez
+1-2 dk
+summarize_runs.py
+İstediğinde
+Anlık
+Şu an ne yapmalısın?
+# 1. Botu başlat
+cd /Users/dream/Desktop/trader
+cargo run
+Birkaç gün veri topladıktan sonra:
+
+# 2. Haftalık optimizasyon
+python3 scripts/auto_tune.py --with-winners
+Bu kadar. Bot çalışır, Python arka planda botu optimize eder.

@@ -1,139 +1,133 @@
 #!/usr/bin/env python3
 """
-runs/*/policy_recommendation.txt dosyalarından özet tablo üretir.
-
-Çıktı: en yeni run en üstte olacak şekilde
-- run_id
-- cost
-- best horizon (EXIT_AFTER_OBS)
-- allowlist
-- next10/30/60 EV'leri (varsa)
+runs/auto_tune_*.txt raporlarından özet tablo üretir.
 
 Kullanım:
   python3 scripts/summarize_runs.py
-  python3 scripts/summarize_runs.py --runs-dir runs --limit 20
+  python3 scripts/summarize_runs.py --runs-dir runs --limit 10
 """
 
 from __future__ import annotations
 
 import argparse
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
 @dataclass
-class Rec:
-    run_id: str
-    cost: str = "?"
-    ev10: str = "?"
-    ev30: str = "?"
-    ev60: str = "?"
-    best: str = "?"
-    allow: str = "?"
+class TuneReport:
+    filename: str
+    date: str = "?"
+    source: str = "?"
+    normal_ev: str = "?"
+    flip_ev: str = "?"
+    score_invert: str = "?"
+    dominant_allow: str = "?"
+    min_edge: str = "?"
+    winner_win_rate: str = "?"
+    winner_pnl: str = "?"
 
 
-RE_COST = re.compile(r"^- cost:\s*([+-]?\d+\.\d+)\s*$")
-RE_HOR = re.compile(r"^\s*next(\d+)\s+n=(\d+)\s+EV=([+-]?\d+\.\d+)\s*$")
-RE_BEST = re.compile(r"^\s*POLYMARKET_EXIT_AFTER_OBS=(\d+)\s+\(n=(\d+)\s+EV=([+-]?\d+\.\d+)\)\s*$")
-RE_BEST_INLINE = re.compile(r"^\s*POLYMARKET_EXIT_AFTER_OBS=(\d+)\s+")
-RE_ALLOW = re.compile(r"^\s*POLYMARKET_TRADE_DOMINANT_ALLOW=(.+?)\s*$")
+RE_DATE          = re.compile(r"=== auto_tune raporu — (.+?) ===")
+RE_SOURCE        = re.compile(r"^Kaynak:\s*(.+)")
+RE_NORMAL_EV     = re.compile(r"^Normal EV toplam\s*:\s*([+-]?\d+\.\d+)")
+RE_FLIP_EV       = re.compile(r"^Flip EV toplam\s*:\s*([+-]?\d+\.\d+)")
+RE_INVERT        = re.compile(r"^\s*POLYMARKET_SCORE_INVERT=(\S+)")
+RE_DOMINANT      = re.compile(r"^\s*POLYMARKET_TRADE_DOMINANT_ALLOW=(\S+)")
+RE_EDGE          = re.compile(r"^\s*POLYMARKET_MIN_EDGE=(\S+)")
+RE_WIN_RATE      = re.compile(r"Kazanma orani\s*:\s*([\d.]+%)")
+RE_PNL           = re.compile(r"Toplam PnL\s*:\s*\$([^\s]+)")
 
 
-def parse_policy_reco(path: Path) -> Rec:
-    run_id = path.parent.name
-    rec = Rec(run_id=run_id)
-    txt = path.read_text(encoding="utf-8", errors="replace").splitlines()
-    in_horiz = False
-    in_env = False
-    for line in txt:
-        m = RE_COST.match(line)
+def parse_report(path: Path) -> TuneReport:
+    r = TuneReport(filename=path.name)
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        m = RE_DATE.search(line)
         if m:
-            rec.cost = m.group(1)
+            r.date = m.group(1)[:16]
             continue
-        if line.startswith("Horizons"):
-            in_horiz = True
-            in_env = False
+        m = RE_SOURCE.match(line)
+        if m:
+            r.source = Path(m.group(1).strip()).parent.name
             continue
-        if line.startswith("Recommended .env"):
-            in_env = True
-            in_horiz = False
+        m = RE_NORMAL_EV.match(line)
+        if m:
+            r.normal_ev = m.group(1)
             continue
-        if line.startswith("Best horizon"):
-            # next line usually contains the env-style best horizon
-            in_env = False
-            in_horiz = False
+        m = RE_FLIP_EV.match(line)
+        if m:
+            r.flip_ev = m.group(1)
             continue
-        if in_horiz:
-            mh = RE_HOR.match(line)
-            if mh:
-                k = mh.group(1)
-                ev = mh.group(3)
-                if k == "10":
-                    rec.ev10 = ev
-                elif k == "30":
-                    rec.ev30 = ev
-                elif k == "60":
-                    rec.ev60 = ev
-        if in_env:
-            mb = RE_BEST.match(line.strip())
-            if mb:
-                rec.best = mb.group(1)
-            else:
-                mb2 = RE_BEST_INLINE.match(line.strip())
-                if mb2:
-                    rec.best = mb2.group(1)
-            ma = RE_ALLOW.match(line.strip())
-            if ma:
-                rec.allow = ma.group(1)
-
-        # Best horizon is printed outside Recommended .env in tune_policy output.
-        mb3 = RE_BEST_INLINE.match(line.strip())
-        if mb3 and rec.best == "?":
-            rec.best = mb3.group(1)
-    return rec
+        m = RE_INVERT.match(line)
+        if m and r.score_invert == "?":
+            r.score_invert = m.group(1).split("#")[0].strip()
+            continue
+        m = RE_DOMINANT.match(line)
+        if m and r.dominant_allow == "?":
+            r.dominant_allow = m.group(1)
+            continue
+        m = RE_EDGE.match(line)
+        if m and r.min_edge == "?":
+            r.min_edge = m.group(1)
+            continue
+        m = RE_WIN_RATE.search(line)
+        if m and r.winner_win_rate == "?":
+            r.winner_win_rate = m.group(1)
+            continue
+        m = RE_PNL.search(line)
+        if m and r.winner_pnl == "?":
+            r.winner_pnl = "$" + m.group(1)
+            continue
+    return r
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="runs policy recommendation özeti")
+    ap = argparse.ArgumentParser(description="auto_tune rapor ozeti")
     ap.add_argument("--runs-dir", type=Path, default=Path("runs"))
-    ap.add_argument(
-        "--limit",
-        type=int,
-        default=30,
-        help="kaç run gösterilsin; 0 = hepsi",
-    )
+    ap.add_argument("--limit", type=int, default=20, help="kac rapor; 0 = hepsi")
     args = ap.parse_args()
 
-    runs_dir: Path = args.runs_dir
-    if not runs_dir.is_dir():
-        raise SystemExit(f"runs-dir yok: {runs_dir}")
+    reports_dir: Path = args.runs_dir
+    if not reports_dir.is_dir():
+        raise SystemExit(f"runs-dir yok: {reports_dir}")
 
-    files = sorted(runs_dir.glob("*/policy_recommendation.txt"), reverse=True)
-    if args.limit != 0:
-        files = files[: max(args.limit, 1)]
+    files = sorted(reports_dir.glob("auto_tune_*.txt"), reverse=True)
+    if args.limit:
+        files = files[: args.limit]
+
     if not files:
-        print("(policy_recommendation.txt bulunamadı)")
+        print("(auto_tune_*.txt raporu bulunamadi)")
+        print("Calistir: python3 scripts/auto_tune.py")
         return 0
 
-    recs = [parse_policy_reco(p) for p in files]
+    recs = [parse_report(p) for p in files]
 
-    # Print table
-    cols = ["run_id", "cost", "best", "allow", "ev10", "ev30", "ev60"]
-    rows = [[getattr(r, c) for c in cols] for r in recs]
-    widths = [max(len(c), *(len(row[i]) for row in rows)) for i, c in enumerate(cols)]
+    cols   = ["date", "source", "normal_ev", "flip_ev", "score_invert", "dominant_allow", "min_edge", "winner_win%"]
+    labels = ["tarih", "kaynak", "EV_normal", "EV_flip", "invert", "dominant", "min_edge", "winner_win%"]
 
-    def fmt_row(row: list[str]) -> str:
-        return "  ".join(row[i].ljust(widths[i]) for i in range(len(cols)))
+    rows = [
+        [r.date, r.source, r.normal_ev, r.flip_ev, r.score_invert,
+         r.dominant_allow, r.min_edge, r.winner_win_rate]
+        for r in recs
+    ]
 
-    print(fmt_row(cols))
+    widths = [
+        max(len(labels[i]), *(len(row[i]) for row in rows))
+        for i in range(len(labels))
+    ]
+
+    def fmt_row(cells: list[str]) -> str:
+        return "  ".join(cells[i].ljust(widths[i]) for i in range(len(labels)))
+
+    print(fmt_row(labels))
     print("  ".join("-" * w for w in widths))
     for row in rows:
         print(fmt_row(row))
 
+    print(f"\n{len(recs)} rapor listelendi.")
     return 0
 
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -229,7 +229,7 @@ def main() -> int:
     print(f"  Cikti                         : {out}")
     if outcome_labeled > 10:
         print(f"\nSonraki adim:")
-        print(f"  python3 scripts/calibrate_signals.py --file {out}")
+        print(f"  python3 scripts/auto_tune.py --input {out} --skip-fetch")
     return 0
 
 
