@@ -147,3 +147,13 @@ Birkaç gün veri topladıktan sonra:
 # 2. Haftalık optimizasyon
 python3 scripts/auto_tune.py --with-winners
 Bu kadar. Bot çalışır, Python arka planda botu optimize eder.
+
+
+
+
+
+python3 scripts/fetch_prices_history.py --input signals.jsonl --out-dir data/prices
+
+python3 scripts/auto_tune.py --input signals.jsonl --skip-fetch --skip-winners
+
+python3 scripts/summarize_runs.py

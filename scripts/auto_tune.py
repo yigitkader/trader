@@ -217,6 +217,84 @@ def compute_ev_table(rows: list[dict[str, Any]], cost: float) -> dict[tuple, dic
     return result
 
 
+def compute_grouped_ev(rows: list[dict[str, Any]], cost: float) -> dict[str, Any]:
+    """
+    Fiyat seviyesi, TTR ve confidence gruplarına göre EV kırılımı.
+    Hangi koşulda flip EV en yüksek? → .env filtreleme için kullan.
+    """
+    def price_band(p: float) -> str:
+        if p < 0.20:   return "cok_ucuz(<0.20)"
+        if p < 0.40:   return "ucuz(0.20-0.40)"
+        if p < 0.60:   return "orta(0.40-0.60)"
+        if p < 0.80:   return "pahali(0.60-0.80)"
+        return             "cok_pahali(>0.80)"
+
+    def ttr_band(ttr: int) -> str:
+        h = ttr / 3600
+        if h < 4:    return "ultra_kisa(<4sa)"
+        if h < 24:   return "kisa(4-24sa)"
+        if h < 72:   return "orta(1-3gun)"
+        return            "uzun(>3gun)"
+
+    def conf_band(c: float) -> str:
+        if c < 0.55: return "dusuk(<0.55)"
+        if c < 0.65: return "orta(0.55-0.65)"
+        return            "yuksek(>0.65)"
+
+    def edge_band(e: float) -> str:
+        ae = abs(e)
+        if ae < 0.05:  return "zayif(<5%)"
+        if ae < 0.10:  return "orta(5-10%)"
+        return              "guclu(>10%)"
+
+    groups: dict[str, dict[str, dict]] = {
+        "fiyat":      defaultdict(lambda: {"w": 0, "n": 0}),
+        "ttr":        defaultdict(lambda: {"w": 0, "n": 0}),
+        "confidence": defaultdict(lambda: {"w": 0, "n": 0}),
+        "edge":       defaultdict(lambda: {"w": 0, "n": 0}),
+    }
+
+    for r in rows:
+        dec = r.get("decision", "")
+        lb  = r.get("labels", {})
+        oy  = lb.get("outcome_yes")
+        if oy is None or dec == "Skip":
+            continue
+
+        yes_price  = float(r.get("tape_price") or r.get("price_at_signal") or 0.5)
+        ttr        = int(r.get("features_snapshot", {}).get("ttr_secs", 0) or 0)
+        confidence = float(r.get("confidence") or 0.5)
+        edge       = float(r.get("edge_score") or 0.0)
+
+        win = (dec == "BuyYes" and oy == 1) or (dec == "BuyNo" and oy == 0)
+        win_flip = not win
+
+        for grp_name, key in [
+            ("fiyat",      price_band(yes_price)),
+            ("ttr",        ttr_band(ttr)),
+            ("confidence", conf_band(confidence)),
+            ("edge",       edge_band(edge)),
+        ]:
+            g = groups[grp_name][key]
+            g["n"] += 1
+            g["w"] += int(win_flip)   # flip win rate göster (SCORE_INVERT=1 varsayımı)
+
+    result: dict[str, Any] = {}
+    for grp_name, buckets in groups.items():
+        result[grp_name] = {}
+        for k, v in sorted(buckets.items()):
+            n = v["n"]
+            wr_flip = v["w"] / n if n else 0
+            bp = 0.5   # yaklaşık
+            ev_flip = wr_flip - bp - cost * bp
+            result[grp_name][k] = {
+                "n": n,
+                "flip_win_rate": round(wr_flip, 4),
+                "flip_ev": round(ev_flip, 4),
+            }
+    return result
+
+
 def compute_flipped_ev(ev_table: dict[tuple, dict]) -> dict[tuple, float]:
     """
     Her (dom, dec) cifte ters yonde acilirsa EV ne olur?
@@ -365,6 +443,7 @@ def build_report(
     cost: float,
     labeled_path: Path,
     winner_analysis: dict[str, Any] | None = None,
+    grouped_ev: dict[str, Any] | None = None,
 ) -> str:
     lines: list[str] = []
     ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -408,6 +487,28 @@ def build_report(
         f"  POLYMARKET_TRADE_DOMINANT_ALLOW={','.join(policy['allowed_dominants']) or 'none'}",
         f"  POLYMARKET_MIN_EDGE={policy['min_edge']}",
     ]
+
+    if grouped_ev:
+        lines += ["", "--- Gruplama analizi (SCORE_INVERT=1 varsayimi ile flip win rate) ---"]
+        group_labels = {
+            "fiyat":      "Fiyat seviyesi",
+            "ttr":        "TTR (kalan sure)",
+            "confidence": "Confidence",
+            "edge":       "Edge buyuklugu",
+        }
+        for grp_key, grp_label in group_labels.items():
+            buckets = grouped_ev.get(grp_key, {})
+            if not buckets:
+                continue
+            lines.append(f"\n  [{grp_label}]")
+            lines.append(f"  {'grup':<25}  {'n':>6}  {'flip_win%':>9}  {'flip_EV':>8}  not")
+            lines.append(f"  {'-'*25}  {'-'*6}  {'-'*9}  {'-'*8}  ---")
+            for k, v in sorted(buckets.items()):
+                n        = v["n"]
+                wr       = v["flip_win_rate"]
+                ev       = v["flip_ev"]
+                flag = " *** EN IYI" if ev == max(x["flip_ev"] for x in buckets.values()) and ev > 0 else ""
+                lines.append(f"  {k:<25}  {n:>6}  {wr:>8.1%}  {ev:>+8.4f}{flag}")
 
     if winner_analysis:
         wa = winner_analysis
@@ -527,6 +628,7 @@ def main() -> int:
     ev_table    = compute_ev_table(outcome_rows, args.cost)
     flipped_evs = compute_flipped_ev(ev_table)
     policy      = select_policy(ev_table, flipped_evs, args.cost, args.ev_min)
+    grouped_ev  = compute_grouped_ev(outcome_rows, args.cost)
 
     # --- Adim 3b: Winner analizi ---
     winner_analysis: dict[str, Any] | None = None
@@ -541,7 +643,7 @@ def main() -> int:
             print("  Yetersiz winner data (atlandi)")
 
     # --- Adim 4: Rapor ---
-    report = build_report(ev_table, flipped_evs, policy, args.cost, labeled_path, winner_analysis)
+    report = build_report(ev_table, flipped_evs, policy, args.cost, labeled_path, winner_analysis, grouped_ev)
     print("\n" + report)
 
     ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
